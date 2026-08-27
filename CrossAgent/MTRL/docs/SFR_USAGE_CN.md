@@ -1,6 +1,6 @@
 # Simple Failure Ranking（SFR）使用说明
 
-本文档说明 Minecraft-RL 中 Simple Failure Ranking（SFR）的实现、数据流、配置、测试和运行方式。SFR 是 trajectory-level 的失败轨迹排序方法：一条完整 episode 结束后只产生一个标量，不产生 step-wise reward，也不训练额外奖励模型。
+本文档说明 Minecraft-RL 中 Simple Failure Ranking（SFR）的实现、数据流、配置、测试和运行方式。SFR 是 trajectory-level 的失败轨迹排序方法：一条完整 episode 结束后只产生一个标量，不产生 step-wise reward。实现支持纯规则 q 和可选的 model-based completion judge；model judge 默认关闭。
 
 ## 1. 解决的问题
 
@@ -13,6 +13,8 @@ SFR 的行为如下：
 3. 在 group 内对 q(tau) 做 mid-rank，并映射为小幅度的相对 reward。
 4. 没有可靠差异证据时 abstain，保持原始 reward。
 5. group 中有成功轨迹，或出现 infra error 时，保持原始 reward。
+
+除了规则模式外，`model_rank` 模式会把每条失败轨迹的终止状态摘要发送给一个 OpenAI-compatible chat-completions 服务，由模型判断任务完成度，再对模型输出的 completion 分数做 group 内排序。模型 judge 只判断任务完成情况，不判断语言表达质量。
 
 算法形式：
 
@@ -45,6 +47,7 @@ K 是 group size。默认 beta=0.2，K=4 且没有并列时，rank reward 为：
         quality_epsilon=0.02,
         random_seed=0,
         feature_weights=None,
+        model_config=None,
     )
 
 返回 new_episode_rewards 和 details。details 包含 q、rank、abstain 标志及日志指标。
@@ -70,6 +73,22 @@ gather_rollout_data 会把以下元数据写入有效 trajectory step：
     sfr_all_failed       所在 group 是否 all-failed
 
 现有 agent_system/reward_manager/episode.py 会把 episode_rewards 放到 response 最后一个有效 token。因此 SFR 没有改动 PPO/GRPO 的 token-level reward 接口。
+
+### 2.3 model-based completion judge
+
+model-based 模式不训练新的 reward model，而是在 episode 结束时调用外部或本地部署的 LLM judge。当前实现要求服务提供 OpenAI-compatible API：
+
+    POST <endpoint>/chat/completions
+
+其中 endpoint 可以填写 `http://127.0.0.1:8000/v1`，代码会自动补上 `/chat/completions`。请求包含任务名、任务描述、初始和终止背包、累计事件、health/food、最近状态和动作统计。不会发送完整视频，也不会把 response token id 当作任务状态。
+
+模型必须返回 JSON，例如：
+
+    {"completion": 0.63, "confidence": 0.91, "reason": "The target item was obtained but the final condition is incomplete."}
+
+`completion` 会裁剪到 `[0, 1]`，表示任务完成度而非成功概率。全失败 group 中的 completion 分数随后使用与规则 SFR 相同的 mid-rank reward。`confidence_threshold` 可以过滤低置信度判断；judge 调用失败时，`fallback=abstain` 保持原始 reward，`fallback=rule` 使用规则 q 排序。
+
+支持的模型类型包括 GPT 类闭源 API 和通过 vLLM/TGI 等暴露 OpenAI-compatible endpoint 的 Qwen 类本地模型。API key 只从 `api_key_env` 指定的环境变量读取，不写入 YAML、命令行日志或 trajectory metadata。
 
 ## 3. q(tau) 质量分数
 
@@ -189,17 +208,34 @@ infra error 不能被当成“更差的策略”参与训练排序。
           loop: 0.05
           death: 0.10
           timeout: 0.05
+        model:
+          endpoint: null
+          model_name: null
+          api_key_env: OPENAI_API_KEY
+          timeout_seconds: 30
+          max_tokens: 128
+          max_prompt_chars: 12000
+          temperature: 0.0
+          confidence_threshold: 0.0
+          fallback: abstain
 
 参数：
 
 | 参数 | 默认值 | 含义 |
 | --- | ---: | --- |
 | algorithm.sfr.enabled | False | 是否启用 SFR。关闭时保持原始 reward。 |
-| algorithm.sfr.mode | sfr | sparse、sfr、random_rank、absolute_q 或 length_rank。 |
+| algorithm.sfr.mode | sfr | sparse、sfr、random_rank、absolute_q、length_rank 或 model_rank。 |
 | algorithm.sfr.beta | 0.2 | rank reward 的最大绝对幅度。建议先用 0.1 或 0.2。 |
 | algorithm.sfr.quality_epsilon | 0.02 | q 差异小于该值时视为同一质量等级。 |
 | algorithm.sfr.random_seed | 0 | random_rank 对照实验的随机种子。 |
 | algorithm.sfr.feature_weights.* | 见 YAML | 各 trajectory-level 特征的权重。 |
+| algorithm.sfr.model.endpoint | null | OpenAI-compatible 服务的 base endpoint，仅 model_rank 使用。 |
+| algorithm.sfr.model.model_name | null | 服务端模型名。 |
+| algorithm.sfr.model.api_key_env | OPENAI_API_KEY | 读取 API key 的环境变量名。 |
+| algorithm.sfr.model.timeout_seconds | 30 | 单条轨迹 judge 请求超时时间。 |
+| algorithm.sfr.model.max_prompt_chars | 12000 | 发送给 judge 的摘要最大字符数。 |
+| algorithm.sfr.model.confidence_threshold | 0.0 | 低于该置信度的判断视为失败。 |
+| algorithm.sfr.model.fallback | abstain | judge 失败时使用 abstain 或 rule。 |
 
 各 mode：
 
@@ -210,6 +246,9 @@ infra error 不能被当成“更差的策略”参与训练排序。
 | random_rank | 随机 sanity check | all-failed group 内使用固定随机数排序。 |
 | absolute_q | 绝对分数对照 | 按 q 的 min-max 结果给 [0, beta] reward。 |
 | length_rank | 长度对照 | 仅按 episode length 排序。 |
+| model_rank | model-based 对照 | 使用 LLM judge 的 completion 分数在 all-failed group 内排序。 |
+
+`model` 是 `model_rank` 的别名。model-based 模式必须显式设置 `SFR_ENABLED=True`，不会因为配置了 endpoint 而自动发送请求。
 
 ## 6. 测试和启动
 
@@ -252,6 +291,22 @@ infra error 不能被当成“更差的策略”参与训练排序。
     SFR_ENABLED=True SFR_MODE=absolute_q bash examples/grpo_trainer/run_minecraft.sh vllm
     SFR_ENABLED=True SFR_MODE=length_rank bash examples/grpo_trainer/run_minecraft.sh vllm
 
+model-based completion judge：
+
+    export SFR_MODEL_ENDPOINT=http://127.0.0.1:8000/v1
+    export SFR_MODEL_NAME=Qwen/Qwen3.5-9B
+    export SFR_MODEL_FALLBACK=abstain
+    SFR_ENABLED=True SFR_MODE=model_rank \
+      bash examples/grpo_trainer/run_minecraft.sh vllm
+
+如果 endpoint 需要鉴权，例如：
+
+    export OPENAI_API_KEY=...
+    export SFR_MODEL_ENDPOINT=https://api.openai.com/v1
+    export SFR_MODEL_NAME=<model-name>
+
+不要把真实 key 写进 shell 脚本或提交到仓库。
+
 启动脚本保留末尾的 $@，也可使用 Hydra override：
 
     bash examples/grpo_trainer/run_minecraft.sh vllm \
@@ -259,7 +314,13 @@ infra error 不能被当成“更差的策略”参与训练排序。
       algorithm.sfr.beta=0.1 \
       algorithm.sfr.quality_epsilon=0.01
 
-服务器实验一次最多使用两张 GPU。脚本 N_GPUS 默认是 2，启动前需要确认 Ray/vLLM 没有占用额外 GPU。
+启动脚本不会对 `N_GPUS` 做代码层面的上限限制，`trainer.n_gpus_per_node` 直接使用 `N_GPUS`。实际使用多少张 GPU 由运行者和集群资源配置决定。
+
+Minecraft worker 的 reset 默认保留原有的随机 `0-180` 秒错峰等待。为了进行快速环境验证，可以设置：
+
+    MINECRAFT_RESET_MAX_DELAY=0
+
+该变量只控制 reset 前的等待时间，不会改变环境状态、任务配置或 SFR 算法；不设置时默认为 `180`，正式训练可保持默认行为。
 
 ## 7. 日志检查
 
@@ -275,6 +336,12 @@ SFR 开启后，训练日志应出现：
     sfr/sfr_reward_mean
     sfr/sfr_reward_std
     sfr/sfr_infra_error_groups
+    sfr/sfr_model_calls
+    sfr/sfr_model_successes
+    sfr/sfr_model_errors
+    sfr/sfr_model_fallbacks
+    sfr/sfr_model_mean_score
+    sfr/sfr_model_score_std
 
 解释：
 
@@ -284,6 +351,7 @@ SFR 开启后，训练日志应出现：
 4. sfr_rank_coverage：ranked all-failed groups / all-failed groups。
 5. 对照 raw_episode_reward 和 sfr_reward，确认只有符合条件的 group 被改写。
 6. 检查同一 uid 内 task_config_hash 是否一致。
+7. model_rank 模式检查 `sfr_model_successes / sfr_model_calls`，以及 `sfr_model_errors` 和 `sfr_model_fallbacks`。
 
 如果没有事件、背包、validity、no-op、loop、death 或 timeout 证据，SFR 会主动 abstain。这是保护逻辑，不是训练崩溃。
 
@@ -298,7 +366,7 @@ SFR 开启后，训练日志应出现：
     [ ] token_level_scores 能看到改写后的 outcome reward
     [ ] sfr_* 指标进入训练日志
     [ ] 没有残留 breakpoint/pdb 导致训练暂停
-    [ ] N_GPUS 不超过 2
+    [ ] N_GPUS 与本次集群资源配置一致
     [ ] 先完成短 smoke test，再启动正式训练
 
 ## 9. 当前边界
@@ -311,5 +379,8 @@ SFR 不是 Minecraft planner、dense reward 或 PRM。它依赖环境 info 中�
 - loop 检测需要位置字段或显式 loop 字段；没有字段时不会伪造证据。
 - q 是启发式 trajectory-level proxy，不应被解释为真实成功概率。
 - random_rank 和 length_rank 只用于诊断和消融。
+- model_rank 的质量依赖 judge 对终止状态摘要的理解；模型输出不是环境真值。
+- model_rank 会增加每个 all-failed group 的 judge 请求数，建议先用短 rollout 验证 endpoint、响应 JSON 格式和调用延迟。
+- model judge 不可用时，默认 fallback=abstain，不会自动伪造模型分数；需要鲁棒运行时可显式设置 fallback=rule。
 
 真实服务器 smoke test 后，应保存一小段 total_infos 或 rollout 日志，确认实际字段名和结构，再调整 feature_weights 或增加 Minecraft 专属解析。

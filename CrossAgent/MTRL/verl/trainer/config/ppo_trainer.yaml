@@ -256,7 +256,7 @@ algorithm:
   sfr:
     # SFR is opt-in. Disabled means the original sparse episode reward path.
     enabled: False
-    # sparse | sfr | random_rank | absolute_q | length_rank
+    # sparse | sfr | random_rank | absolute_q | length_rank | model_rank
     mode: sfr
     beta: 0.2
     quality_epsilon: 0.02
@@ -270,6 +270,18 @@ algorithm:
       loop: 0.05
       death: 0.10
       timeout: 0.05
+    model:
+      # OpenAI-compatible endpoint, for example http://127.0.0.1:8000/v1
+      endpoint: null
+      model_name: null
+      api_key_env: OPENAI_API_KEY
+      timeout_seconds: 30
+      max_tokens: 128
+      max_prompt_chars: 12000
+      temperature: 0.0
+      confidence_threshold: 0.0
+      # abstain keeps the original reward; rule falls back to rule q.
+      fallback: abstain
 
 trainer:
   balance_batch: True

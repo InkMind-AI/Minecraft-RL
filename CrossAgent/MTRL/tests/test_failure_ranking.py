@@ -141,3 +141,66 @@ def test_short_success_and_length_inputs_are_padded_safely():
     )
     assert np.allclose(rewards, 0.0)
     assert result["metrics"]["sfr_all_failed_groups"] == 1
+
+
+def test_model_rank_uses_completion_judge_scores():
+    trajectories = [
+        make_trajectory("g", target_count=0),
+        make_trajectory("g", target_count=0),
+        make_trajectory("g", target_count=0),
+        make_trajectory("g", target_count=0),
+    ]
+    scores = iter([0.05, 0.35, 0.65, 0.95])
+
+    def judge(prompt):
+        assert "mine_block:oak_log" in prompt
+        return {"completion": next(scores), "confidence": 1.0}
+
+    rewards, result = MODULE.relabel_episode_rewards(
+        trajectory_steps=[item[0] for item in trajectories],
+        episode_rewards=[0, 0, 0, 0],
+        episode_lengths=[10] * 4,
+        success=[0] * 4,
+        max_steps=20,
+        trajectory_infos=[item[1] for item in trajectories],
+        mode="model_rank",
+        beta=0.2,
+        model_config={"fallback": "abstain"},
+        model_judge=judge,
+    )
+    assert np.allclose(sorted(rewards.tolist()), [-0.2, -0.06666667, 0.06666667, 0.2], atol=1e-5)
+    assert result["metrics"]["sfr_model_calls"] == 4
+    assert result["metrics"]["sfr_model_successes"] == 4
+    assert result["metrics"]["sfr_model_errors"] == 0
+
+
+def test_model_judge_failure_abstains_without_changing_reward():
+    trajectories = [make_trajectory("g"), make_trajectory("g")]
+
+    def failing_judge(prompt):
+        raise RuntimeError("judge unavailable")
+
+    rewards, result = MODULE.relabel_episode_rewards(
+        trajectory_steps=[item[0] for item in trajectories],
+        episode_rewards=[-0.1, 0.0],
+        episode_lengths=[10, 10],
+        success=[0, 0],
+        max_steps=20,
+        trajectory_infos=[item[1] for item in trajectories],
+        mode="model_rank",
+        model_config={"fallback": "abstain"},
+        model_judge=failing_judge,
+    )
+    assert np.allclose(rewards, [-0.1, 0.0])
+    assert result["metrics"]["sfr_model_errors"] == 2
+    assert result["metrics"]["sfr_abstain_groups"] == 1
+    assert all(step["sfr_abstain"] for trajectory in trajectories for step in trajectory[0])
+    assert all(step["sfr_all_failed"] for trajectory in trajectories for step in trajectory[0])
+
+
+def test_model_judge_can_parse_json_text_and_clamp_score():
+    parsed = MODULE._parse_model_judgement(
+        '```json\n{"completion": 1.7, "confidence": -0.2}\n```'
+    )
+    assert parsed["score"] == 1.0
+    assert parsed["confidence"] == 0.0

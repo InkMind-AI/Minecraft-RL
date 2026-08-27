@@ -81,6 +81,7 @@ class TrajectoryCollector:
             quality_epsilon=float(sfr_config.get("quality_epsilon", 0.02)),
             random_seed=int(sfr_config.get("random_seed", 0)),
             feature_weights=sfr_config.get("feature_weights", None),
+            model_config=sfr_config.get("model", None),
         )
         for index, trajectory in enumerate(total_batch_list):
             for step in trajectory:

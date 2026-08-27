@@ -8,6 +8,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
+import urllib.error
+import urllib.request
 from collections import defaultdict
 from typing import Any, Mapping, Sequence
 
@@ -55,6 +59,186 @@ def _scalar(value: Any) -> Any:
     if isinstance(value, np.generic):
         return value.item()
     return value
+
+
+def _compact_value(value: Any, max_items: int = 32) -> Any:
+    """Convert nested environment values into a bounded JSON-friendly object."""
+    if isinstance(value, Mapping):
+        items = list(value.items())[:max_items]
+        return {str(key): _compact_value(item, max_items) for key, item in items}
+    if isinstance(value, (list, tuple)):
+        return [_compact_value(item, max_items) for item in list(value)[:max_items]]
+    if isinstance(value, np.ndarray):
+        return _compact_value(value.tolist(), max_items)
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _model_prompt(
+    infos: Sequence[Mapping[str, Any]],
+    trajectory_steps: Sequence[Mapping[str, Any]] | None,
+    episode_length: int,
+    max_chars: int,
+) -> str:
+    """Build a compact terminal-state prompt for a model completion judge."""
+    infos = [info for info in infos if isinstance(info, Mapping)]
+    first = infos[0] if infos else {}
+    last = infos[-1] if infos else {}
+    event_history = [_event_counts(info) for info in infos]
+    event_max: dict[str, float] = {}
+    for event_map in event_history:
+        for key, value in event_map.items():
+            event_max[key] = max(event_max.get(key, 0.0), float(value))
+
+    state_keys = (
+        "task_name",
+        "task_description",
+        "inventory",
+        "inventory_stats",
+        "health",
+        "food_level",
+        "won",
+        "death_detected",
+        "dead",
+        "respawn_detected",
+        "step_count",
+    )
+    terminal_state = {
+        key: _compact_value(last[key])
+        for key in state_keys
+        if key in last
+    }
+    initial_state = {
+        key: _compact_value(first[key])
+        for key in ("inventory", "inventory_stats", "health", "food_level")
+        if key in first
+    }
+    valid_values = [
+        _as_bool(step.get("is_action_valid"), True)
+        for step in trajectory_steps or []
+        if isinstance(step, Mapping) and "is_action_valid" in step
+    ]
+    noop_values = [
+        _as_bool(step.get("action_is_noop"))
+        for step in trajectory_steps or []
+        if isinstance(step, Mapping) and "action_is_noop" in step
+    ]
+    payload = {
+        "task": _compact_value(last.get("task_name", first.get("task_name", ""))),
+        "task_description": _compact_value(
+            last.get("task_description", first.get("task_description", ""))
+        ),
+        "episode_length": int(episode_length),
+        "initial_state": initial_state,
+        "terminal_state": terminal_state,
+        "cumulative_events": event_max,
+        "valid_action_ratio": float(np.mean(valid_values)) if valid_values else None,
+        "noop_ratio": float(np.mean(noop_values)) if noop_values else None,
+        "recent_states": [
+            {
+                key: _compact_value(info[key])
+                for key in state_keys
+                if key in info
+            }
+            for info in infos[-5:]
+        ],
+    }
+    serialized = json.dumps(payload, ensure_ascii=False, default=str)
+    serialized = serialized[: max(int(max_chars), 1000)]
+    return (
+        "You are a Minecraft task-completion evaluator. Evaluate only how close "
+        "the trajectory is to completing the stated task. Do not reward trajectory "
+        "length, eloquence, or action validity unless it provides evidence of task "
+        "completion. Return JSON only with: completion (number in [0,1]), "
+        "confidence (number in [0,1]), and a short reason. A completion of 1 means "
+        "the terminal state satisfies the task; 0 means no task-relevant progress. "
+        "This trajectory is known to be unsuccessful, so score partial progress, "
+        "not binary success.\n\nTrajectory summary:\n"
+        + serialized
+    )
+
+
+def _parse_model_judgement(response: Any) -> dict[str, Any]:
+    """Parse a judge response from a dict or JSON embedded in text."""
+    if isinstance(response, (int, float, np.number)):
+        candidate = {"score": response}
+    elif isinstance(response, Mapping):
+        candidate = response
+    else:
+        text = str(response or "")
+        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if not match:
+            raise ValueError("model response does not contain a JSON object")
+        candidate = json.loads(match.group(0))
+    score = candidate.get(
+        "completion",
+        candidate.get("task_completion", candidate.get("progress", candidate.get("score"))),
+    )
+    if score is None:
+        raise ValueError("model response does not contain completion score")
+    score = _as_float(score, np.nan)
+    if not np.isfinite(score):
+        raise ValueError("model completion score is not finite")
+    confidence = _as_float(candidate.get("confidence", 1.0), 1.0)
+    return {
+        "score": float(np.clip(score, 0.0, 1.0)),
+        "confidence": float(np.clip(confidence, 0.0, 1.0)),
+        "reason": str(candidate.get("reason", ""))[:256],
+    }
+
+
+def _call_model_judge(prompt: str, model_config: Mapping[str, Any]) -> dict[str, Any]:
+    """Call an OpenAI-compatible chat-completions endpoint without extra deps."""
+    endpoint = str(model_config.get("endpoint", "") or "").strip().rstrip("/")
+    if not endpoint:
+        raise RuntimeError("model judge endpoint is empty")
+    if not endpoint.endswith("/chat/completions"):
+        endpoint += "/chat/completions"
+    payload = {
+        "model": str(model_config.get("model_name", "") or ""),
+        "messages": [
+            {
+                "role": "system",
+                "content": "Output valid JSON only. Do not use markdown fences.",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": float(model_config.get("temperature", 0.0)),
+        "max_tokens": int(model_config.get("max_tokens", 128)),
+    }
+    if not payload["model"]:
+        payload.pop("model")
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    api_key_env = str(model_config.get("api_key_env", "OPENAI_API_KEY"))
+    api_key = str(os.environ.get(api_key_env, "")) if api_key_env else ""
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    request = urllib.request.Request(endpoint, data=body, headers=headers, method="POST")
+    timeout = float(model_config.get("timeout_seconds", 30.0))
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            response_body = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read(512).decode("utf-8", errors="replace")
+        raise RuntimeError(f"model judge HTTP {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"model judge connection failed: {exc.reason}") from exc
+    response_json = json.loads(response_body)
+    choices = response_json.get("choices", [])
+    if not choices:
+        raise ValueError("model judge response has no choices")
+    message = choices[0].get("message", {})
+    content = message.get("content", "") if isinstance(message, Mapping) else ""
+    if isinstance(content, list):
+        content = "".join(
+            str(item.get("text", "")) if isinstance(item, Mapping) else str(item)
+            for item in content
+        )
+    return _parse_model_judgement(content)
 
 
 def stable_config_hash(value: Any) -> str:
@@ -464,6 +648,8 @@ def relabel_episode_rewards(
     random_seed: int = 0,
     fallback_uids: Sequence[Any] | None = None,
     feature_weights: Mapping[str, float] | None = None,
+    model_config: Mapping[str, Any] | None = None,
+    model_judge=None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Relabel complete-episode rewards and annotate trajectory steps."""
     rewards = np.asarray(episode_rewards, dtype=np.float32).copy()
@@ -474,7 +660,15 @@ def relabel_episode_rewards(
     raw_successes = np.asarray(success, dtype=np.float32).reshape(-1)
     successes[: min(len(successes), len(raw_successes))] = raw_successes[: len(successes)]
     mode = str(mode or "sparse").lower()
-    supported_modes = {"sparse", "sfr", "random_rank", "absolute_q", "length_rank"}
+    supported_modes = {
+        "sparse",
+        "sfr",
+        "random_rank",
+        "absolute_q",
+        "length_rank",
+        "model_rank",
+        "model",
+    }
     if mode not in supported_modes:
         raise ValueError(
             f"Unsupported SFR mode: {mode}. Expected one of {sorted(supported_modes)}"
@@ -482,12 +676,18 @@ def relabel_episode_rewards(
     weights = dict(DEFAULT_FEATURE_WEIGHTS)
     if feature_weights:
         weights.update({str(key): float(value) for key, value in feature_weights.items()})
+    model_config = dict(model_config or {})
+    model_mode = mode in {"model", "model_rank"}
 
     n = len(rewards)
     qualities = np.zeros(n, dtype=np.float32)
     ranks = np.full(n, -1.0, dtype=np.float32)
     abstain = np.zeros(n, dtype=np.bool_)
     all_failed = np.zeros(n, dtype=np.bool_)
+    model_scores = np.full(n, -1.0, dtype=np.float32)
+    model_confidences = np.zeros(n, dtype=np.float32)
+    model_errors = np.zeros(n, dtype=np.bool_)
+    model_fallback = np.zeros(n, dtype=np.bool_)
     summaries: list[dict[str, Any]] = []
     for index in range(n):
         if trajectory_infos is not None and index < len(trajectory_infos):
@@ -521,6 +721,12 @@ def relabel_episode_rewards(
         "sfr_mean_quality": float(np.mean(qualities)) if n else 0.0,
         "sfr_quality_std": float(np.std(qualities)) if n else 0.0,
         "sfr_infra_error_groups": 0,
+        "sfr_model_calls": 0,
+        "sfr_model_successes": 0,
+        "sfr_model_errors": 0,
+        "sfr_model_fallbacks": 0,
+        "sfr_model_mean_score": 0.0,
+        "sfr_model_score_std": 0.0,
     }
 
     groups = _group_indices(trajectory_steps, fallback_uids=fallback_uids)
@@ -567,15 +773,84 @@ def relabel_episode_rewards(
             group_values = [float(lengths[index]) for index in indices]
         elif mode == "random_rank":
             group_values = list(rng.random(len(indices)))
+        elif model_mode:
+            model_group_error = False
+            for index in indices:
+                metrics["sfr_model_calls"] += 1
+                try:
+                    infos = (
+                        trajectory_infos[index]
+                        if trajectory_infos is not None and index < len(trajectory_infos)
+                        else [
+                            step.get("info")
+                            for step in trajectory_steps[index]
+                            if isinstance(step, Mapping)
+                            and isinstance(step.get("info"), Mapping)
+                        ]
+                    )
+                    prompt = _model_prompt(
+                        infos=infos,
+                        trajectory_steps=trajectory_steps[index],
+                        episode_length=int(lengths[index]),
+                        max_chars=int(model_config.get("max_prompt_chars", 12000)),
+                    )
+                    response = (
+                        model_judge(prompt)
+                        if model_judge is not None
+                        else _call_model_judge(prompt, model_config)
+                    )
+                    judgement = _parse_model_judgement(response)
+                    confidence_threshold = float(
+                        model_config.get("confidence_threshold", 0.0)
+                    )
+                    if judgement["confidence"] < confidence_threshold:
+                        raise ValueError(
+                            "model confidence is below configured threshold"
+                        )
+                    model_scores[index] = judgement["score"]
+                    model_confidences[index] = judgement["confidence"]
+                    metrics["sfr_model_successes"] += 1
+                except Exception:
+                    model_errors[index] = True
+                    model_group_error = True
+                    metrics["sfr_model_errors"] += 1
+
+            if model_group_error:
+                fallback = str(model_config.get("fallback", "abstain")).lower()
+                if fallback == "rule":
+                    model_fallback[indices] = True
+                    metrics["sfr_model_fallbacks"] += len(indices)
+                    group_values = [float(qualities[index]) for index in indices]
+                else:
+                    abstain[indices] = True
+                    metrics["sfr_abstain_groups"] += 1
+                    for index in indices:
+                        _attach_metadata(
+                            trajectory_steps,
+                            index,
+                            {
+                                "sfr_reward": float(rewards[index]),
+                                "sfr_quality": float(qualities[index]),
+                                "sfr_rank": -1.0,
+                                "sfr_abstain": True,
+                                "sfr_all_failed": True,
+                                "sfr_infra_error": False,
+                            },
+                        )
+                    continue
+            else:
+                group_values = [float(model_scores[index]) for index in indices]
         else:
             group_values = [float(qualities[index]) for index in indices]
 
         group_ranks, has_difference = _midranks(group_values, quality_epsilon)
         has_evidence = any(summaries[index]["evidence"] > 0 for index in indices)
-        if mode == "sfr" and (not has_difference or not has_evidence):
+        requires_evidence = mode == "sfr" or bool(np.any(model_fallback[indices]))
+        if (mode in {"sfr", "model", "model_rank"}) and (
+            not has_difference or (requires_evidence and not has_evidence)
+        ):
             abstain[indices] = True
             metrics["sfr_abstain_groups"] += 1
-            rewards[indices] = 0.0
             for index in indices:
                 _attach_metadata(
                     trajectory_steps,
@@ -642,12 +917,31 @@ def relabel_episode_rewards(
     metrics["sfr_reward_mean"] = float(np.mean(rewards)) if n else 0.0
     metrics["sfr_reward_std"] = float(np.std(rewards)) if n else 0.0
     metrics["sfr_abstain_ratio"] = float(np.mean(abstain)) if n else 0.0
+    valid_model_scores = model_scores[model_scores >= 0.0]
+    if len(valid_model_scores):
+        metrics["sfr_model_mean_score"] = float(np.mean(valid_model_scores))
+        metrics["sfr_model_score_std"] = float(np.std(valid_model_scores))
+    for index in range(n):
+        _attach_metadata(
+            trajectory_steps,
+            index,
+            {
+                "sfr_model_score": float(model_scores[index]),
+                "sfr_model_confidence": float(model_confidences[index]),
+                "sfr_model_error": bool(model_errors[index]),
+                "sfr_model_fallback": bool(model_fallback[index]),
+            },
+        )
     return rewards, {
         "metrics": metrics,
         "qualities": qualities,
         "ranks": ranks,
         "abstain": abstain,
         "all_failed": all_failed,
+        "model_scores": model_scores,
+        "model_confidences": model_confidences,
+        "model_errors": model_errors,
+        "model_fallback": model_fallback,
         "summaries": summaries,
     }
 

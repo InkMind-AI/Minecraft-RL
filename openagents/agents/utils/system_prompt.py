@@ -1,17 +1,22 @@
+from pathlib import Path
 
-with open("openagents/assets/system_prompt/grounding.txt", 'r') as f:
+
+_SYSTEM_PROMPT_DIR = Path(__file__).resolve().parents[3] / "openagents" / "assets" / "system_prompt"
+
+
+with open(_SYSTEM_PROMPT_DIR / "grounding.txt", 'r') as f:
     GROUNDING_PROMPT = f.read()
     
-with open("openagents/assets/system_prompt/motion.txt", 'r') as f:
+with open(_SYSTEM_PROMPT_DIR / "motion.txt", 'r') as f:
     MOTION_PROMPT = f.read()
 
-with open("openagents/assets/system_prompt/text_action.txt", 'r') as f:
+with open(_SYSTEM_PROMPT_DIR / "text_action.txt", 'r') as f:
     TEXT_ACTION_PROMPT = f.read()
     
-with open("openagents/assets/system_prompt/grounding-coa.txt", 'r') as f:
+with open(_SYSTEM_PROMPT_DIR / "grounding-coa.txt", 'r') as f:
     GROUNDING_COA_PROMPT = f.read()
     
-with open("openagents/assets/system_prompt/motion-coa.txt", 'r') as f:
+with open(_SYSTEM_PROMPT_DIR / "motion-coa.txt", 'r') as f:
     MOTION_COA_PROMPT = f.read()
 
 grounding_system_prompt = GROUNDING_PROMPT
