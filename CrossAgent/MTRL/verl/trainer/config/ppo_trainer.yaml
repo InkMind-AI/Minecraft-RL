@@ -253,6 +253,23 @@ algorithm:
   filter_groups: # DAPO from https://arxiv.org/abs/2503.14476
     enable: False
     max_num_gen_batches: 10
+  sfr:
+    # SFR is opt-in. Disabled means the original sparse episode reward path.
+    enabled: False
+    # sparse | sfr | random_rank | absolute_q | length_rank
+    mode: sfr
+    beta: 0.2
+    quality_epsilon: 0.02
+    random_seed: 0
+    feature_weights:
+      event: 0.30
+      inventory: 0.25
+      validity: 0.15
+      survival: 0.15
+      noop: 0.05
+      loop: 0.05
+      death: 0.10
+      timeout: 0.05
 
 trainer:
   balance_batch: True

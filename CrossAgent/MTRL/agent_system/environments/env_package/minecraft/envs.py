@@ -12,12 +12,54 @@ from openagents.envs.callbacks.initial_action import InitialActionCallback
 import copy
 import sys
 import os
+import hashlib
+import json
 from openagents.envs.tasks.craft_item import get_available_craft_recipes, gen_craft_item_task_config_old, item_counts
 from datetime import datetime
 import time
 from minestudio.simulator.callbacks.reward_move import RewardsMoveCallback
 from openagents.envs.tasks.task_manager import choose_available_task
 from openagents.envs.env import env_init
+
+
+def _stable_config_hash(value):
+    """Hash task config without importing the rollout collector package."""
+    def normalize(item):
+        if isinstance(item, dict):
+            return {
+                str(key): normalize(item[key])
+                for key in sorted(item, key=lambda key: str(key))
+            }
+        if isinstance(item, (list, tuple)):
+            return [normalize(child) for child in item]
+        if isinstance(item, np.ndarray):
+            return normalize(item.tolist())
+        if isinstance(item, np.generic):
+            return item.item()
+        return item
+
+    payload = json.dumps(
+        normalize(value), sort_keys=True, ensure_ascii=True, default=str
+    )
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _is_noop_raw_action(raw_action):
+    """Detect a decoded action with no button press and no camera motion."""
+    if not isinstance(raw_action, dict):
+        return False
+    button_keys = (
+        "attack", "back", "forward", "jump", "left", "right",
+        "sneak", "sprint", "use", "drop", "inventory",
+        "hotbar.1", "hotbar.2", "hotbar.3", "hotbar.4",
+        "hotbar.5", "hotbar.6", "hotbar.7", "hotbar.8", "hotbar.9",
+    )
+    button_on = any(
+        float(np.asarray(raw_action.get(key, 0)).reshape(-1)[0]) != 0
+        for key in button_keys
+    )
+    camera = np.asarray(raw_action.get("camera", [0.0, 0.0]), dtype=np.float32)
+    return not button_on and not np.any(np.abs(camera) > 1e-6)
 # -----------------------------------------------------------------------------
 # Ray remote worker actor -----------------------------------------------------
 # -----------------------------------------------------------------------------
@@ -33,6 +75,8 @@ class MinecraftWorker:
         self.cur_step = 0
         self.reset_num = 0
         self.won = False
+        self._last_task_config_hash = None
+        self._infra_error = False
         
     def step(self, action):
         """Execute a step in the environment"""
@@ -43,10 +87,18 @@ class MinecraftWorker:
         thought = action["thought"]
         try:
             obs, reward, terminated, truncated, info = self.env.step(raw_action)
-        except:
+        except Exception as exc:
             print("⏱️ MinecraftWorker step 超时，正在重试...)")
-            obs_image, info = self.reset()
-            return obs_image, 0,0, info
+            self._infra_error = True
+            info = {
+                "won": self.won,
+                "step_count": self.cur_step,
+                "task_name": self.task_name,
+                "task_description": self.task_description,
+                "infra_error": True,
+                "error": repr(exc),
+            }
+            return np.zeros((1, 1, 3), dtype=np.uint8), 0.0, True, info
             
 
         print(f"env_id:{self.env_id}, Rollout step: {self.cur_step}")
@@ -61,6 +113,9 @@ class MinecraftWorker:
         info["step_count"] = self.cur_step
         info["task_name"] = self.task_name
         info["task_description"] = self.task_description
+        info["task_config_hash"] = self._last_task_config_hash
+        info["infra_error"] = self._infra_error
+        info["action_is_noop"] = _is_noop_raw_action(raw_action)
         if reward > 0 and self.won:
             terminated = True
         
@@ -75,6 +130,8 @@ class MinecraftWorker:
         self.task_name = self.env_kwargs["task_name"]
         self.task_description = self.env_kwargs["task_description"]
         self.won = False
+        self._infra_error = False
+        self._last_task_config_hash = _stable_config_hash(self.env_kwargs.get("task_config", {}))
         self.record_path = self.env_kwargs.get("rollout_path", None)
         datetime_str = datetime.now().strftime("%Y%m%d-%H%M%S")
         self.record_path = None if self.record_path is None else os.path.join(self.record_path, f"{datetime_str}_reset_{self.reset_num}_{self.task_name}")       
@@ -109,6 +166,8 @@ class MinecraftWorker:
         info["step_count"] = self.cur_step
         info["task_name"] = self.task_name
         info["task_description"] = self.task_description
+        info["task_config_hash"] = self._last_task_config_hash
+        info["infra_error"] = self._infra_error
         self.cur_step = 0
         self.reset_num += 1
         return obs["image"], info
@@ -133,7 +192,7 @@ class MinecraftWorker:
             print("保存视频成功:", self.record_path)
         except:
             print("保存视频失败")
-            breakpoint()
+            return None
 
     def ready(self):
         return True
@@ -184,13 +243,16 @@ class MinecraftMultiProcessEnv(gym.Env):
         while True:
             try:
                 self._workers = []
+                self._group_kwargs = []
                 futures = []
-                for idx in range(self.num_processes):
-                    task = self.tasks[idx // self.group_n]
-                    _env_kwargs = self.format_kwargs(task) #(self.rgs, idx)
-                    worker = (MinecraftWorker.remote(idx))
-                    self._workers.append(worker)
-                    futures.append(worker.reset.remote(_env_kwargs))
+                for group_idx, task in enumerate(self.tasks[:self.env_num]):
+                    group_kwargs = self.format_kwargs(task)
+                    self._group_kwargs.append(copy.deepcopy(group_kwargs))
+                    for group_offset in range(self.group_n):
+                        idx = group_idx * self.group_n + group_offset
+                        worker = MinecraftWorker.remote(idx)
+                        self._workers.append(worker)
+                        futures.append(worker.reset.remote(copy.deepcopy(group_kwargs)))
                 results = ray.get(futures, timeout = 1800)
                 break
             except Exception as e:
@@ -227,7 +289,10 @@ class MinecraftMultiProcessEnv(gym.Env):
 
 
     def format_kwargs(self, task): #minicase
-        task_config = choose_available_task(task,difficulty="zero")
+        if isinstance(task, dict):
+            task_config = copy.deepcopy(task)
+        else:
+            task_config = choose_available_task(task,difficulty="zero")
         env_kwargs = {
             "group_n": self.group_n,
             "action_type": "env",
@@ -324,8 +389,11 @@ class MinecraftMultiProcessEnv(gym.Env):
         assert 0 <= env_id < len(self._workers), f"Invalid env_id: {env_id}"
         if env_kwargs is None:
             idx = env_id // self.group_n #random.randint(0, len(self.tasks)-1)
-            task = self.tasks[idx]
-            env_kwargs = self.format_kwargs(task)
+            if idx < len(getattr(self, "_group_kwargs", [])):
+                env_kwargs = copy.deepcopy(self._group_kwargs[idx])
+            else:
+                task = self.tasks[idx]
+                env_kwargs = self.format_kwargs(task)
 
         future = self._workers[env_id].reset.remote(env_kwargs)
         obs, info = ray.get(future, timeout=1800)

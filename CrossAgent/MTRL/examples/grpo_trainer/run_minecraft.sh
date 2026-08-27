@@ -4,7 +4,15 @@ export VLLM_ATTENTION_BACKEND=XFORMERS
 
 train_data_size=1
 val_data_size=1
-group_size=1
+group_size=${GROUP_SIZE:-4}
+sfr_enabled=${SFR_ENABLED:-False}
+sfr_mode=${SFR_MODE:-sfr}
+n_gpus=${N_GPUS:-2}
+
+if (( n_gpus < 1 || n_gpus > 2 )); then
+    echo "N_GPUS must be between 1 and 2 for this experiment, got: ${n_gpus}" >&2
+    exit 1
+fi
 
 project_name='verl_agent_minecraft_dynamicsampling'
 experiment_name='grpo'
@@ -19,6 +27,11 @@ python3 -m examples.data_preprocess.prepare \
 RAY_DEBUG=legacy python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     algorithm.filter_groups.enable=False \
+    algorithm.sfr.enabled=$sfr_enabled \
+    algorithm.sfr.mode=$sfr_mode \
+    algorithm.sfr.beta=${SFR_BETA:-0.2} \
+    algorithm.sfr.quality_epsilon=${SFR_EPSILON:-0.02} \
+    algorithm.sfr.random_seed=${SFR_SEED:-0} \
     algorithm.dynamic_rollouts=True \
     algorithm.filter_groups.max_num_gen_batches=4 \
     data.train_files=$HOME/data/verl-agent/text/train.parquet \
@@ -67,7 +80,7 @@ RAY_DEBUG=legacy python3 -m verl.trainer.main_ppo \
     trainer.project_name=${project_name} \
     trainer.experiment_name=${experiment_name} \
     trainer.default_local_dir=checkpoints/${project_name}/${experiment_name} \
-    trainer.n_gpus_per_node=8 \
+    trainer.n_gpus_per_node=$n_gpus \
     trainer.nnodes=1 \
     trainer.save_freq=10 \
     trainer.test_freq=10 \

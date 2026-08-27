@@ -640,9 +640,6 @@ class EnvHistory:
             # 下一张 image 的 user 帧
             self.texts.append({"content": [{"type": "text", "text": "<image>"}], "role": "user"})
             self.images.append(next_image)
-            if (len(self.images)>=5):
-                import pdb
-                pdb.set_trace()
             # print("length of images:", len(self.images))
 
     def snapshot(self):
@@ -703,7 +700,7 @@ class MinecraftEnvironmentManager(EnvironmentManagerBase):
     # --------- 单环境 step（异步路径用） ----------
     def step_one(self, env_id: int, text_action: str):
         self._ensure_histories_initialized()
-        actions, _ = self.projection_f([text_action])
+        actions, valids = self.projection_f([text_action])
         action = actions[0]
         next_obs, reward, done, info = self.envs.step_single(env_id, action)
         # thought 提取（你也可传入 action["thought"]）
@@ -711,7 +708,7 @@ class MinecraftEnvironmentManager(EnvironmentManagerBase):
         self._histories[env_id].append_turn(thought, self._image_from(next_obs), info["task_description"])
         reward = to_numpy(reward)
         done = to_numpy(done)
-        info['is_action_valid'] = to_numpy(info.get('is_action_valid', True))
+        info['is_action_valid'] = to_numpy(valids[0])
         return self.make_obs_view(env_id, next_obs), reward, done, info
 
     # --------- 兼容：批量 build_text_obs（如果旧代码会用到） ----------
