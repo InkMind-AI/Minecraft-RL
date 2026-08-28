@@ -17,6 +17,7 @@ def get_rope_index(processor, *args, **kwargs):
         return get_rope_index_qwen3_vl(processor, *args, **kwargs)
     return get_rope_index_qwen2_vl(processor, *args, **kwargs)
 from agent_system.multi_turn_rollout.utils import process_image, to_list_of_dict, torch_to_numpy, filter_group_data
+from agent_system.multi_turn_rollout.failure_ranking import relabel_episode_rewards
 from agent_system.environments import EnvironmentManagerBase
 from typing import List, Dict
 from tqdm import tqdm
@@ -38,6 +39,56 @@ class TrajectoryCollector:
         self.config = config
         self.tokenizer = tokenizer
         self.processor = processor
+        self._sfr_active = False
+        self._sfr_metrics = {}
+
+    def _apply_failure_ranking(
+        self,
+        total_batch_list,
+        total_infos,
+        episode_rewards,
+        episode_lengths,
+        success,
+    ):
+        """Apply SFR after complete episodes and before dynamic filtering."""
+        if not self._sfr_active:
+            return episode_rewards
+
+        algorithm = getattr(self.config, "algorithm", None)
+        sfr_config = (
+            algorithm.get("sfr", {})
+            if algorithm is not None and hasattr(algorithm, "get")
+            else {}
+        )
+        success_values = np.zeros(len(total_batch_list), dtype=np.float32)
+        raw_success_values = np.asarray(
+            success.get("success_rate", []),
+            dtype=np.float32,
+        ).reshape(-1)
+        success_values[: min(len(success_values), len(raw_success_values))] = (
+            raw_success_values[: len(success_values)]
+        )
+        raw_rewards = np.asarray(episode_rewards, dtype=np.float32).copy()
+        relabeled_rewards, result = relabel_episode_rewards(
+            trajectory_steps=total_batch_list,
+            trajectory_infos=total_infos,
+            episode_rewards=raw_rewards,
+            episode_lengths=episode_lengths,
+            success=success_values,
+            max_steps=int(self.config.env.max_steps),
+            mode=sfr_config.get("mode", "sparse"),
+            beta=float(sfr_config.get("beta", 0.2)),
+            quality_epsilon=float(sfr_config.get("quality_epsilon", 0.02)),
+            random_seed=int(sfr_config.get("random_seed", 0)),
+            feature_weights=sfr_config.get("feature_weights", None),
+            model_config=sfr_config.get("model", None),
+        )
+        for index, trajectory in enumerate(total_batch_list):
+            for step in trajectory:
+                if isinstance(step, dict):
+                    step["raw_episode_reward"] = float(raw_rewards[index])
+        self._sfr_metrics.update(result["metrics"])
+        return relabeled_rewards
 
     def preprocess_single_sample(
         self,
@@ -117,7 +168,7 @@ class TrajectoryCollector:
                 row_dict['multi_modal_data'] = {'image': [process_image(obs_image)]}
             
             if len(row_dict['multi_modal_data']['image']) == 0:
-                breakpoint()
+                raise ValueError("No image was produced for a multimodal observation")
             image_inputs = self.processor.image_processor(row_dict['multi_modal_data']['image'], return_tensors='pt')
             image_grid_thw = image_inputs['image_grid_thw']
             row_dict['multi_modal_inputs'] = {key: val for key, val in image_inputs.items()}
@@ -262,6 +313,12 @@ class TrajectoryCollector:
                 if data['active_masks']:
                     # episode_rewards
                     data['episode_rewards'] = episode_rewards[bs]
+                    data['raw_episode_reward'] = data.get('raw_episode_reward', episode_rewards[bs])
+                    data['sfr_reward'] = data.get('sfr_reward', episode_rewards[bs])
+                    data['sfr_quality'] = data.get('sfr_quality', 0.0)
+                    data['sfr_rank'] = data.get('sfr_rank', -1.0)
+                    data['sfr_abstain'] = data.get('sfr_abstain', False)
+                    data['sfr_all_failed'] = data.get('sfr_all_failed', False)
                     data['episode_rewards_mean'] = episode_rewards_mean
                     data['episode_rewards_min'] = episode_rewards_min
                     data['episode_rewards_max'] = episode_rewards_max
@@ -360,7 +417,6 @@ class TrajectoryCollector:
 
             batch.non_tensor_batch["uid"] = uid_batch
             batch.non_tensor_batch['traj_uid'] = traj_uid
-            breakpoint()
             batch = batch.union(batch_output)
             
             text_actions = self.tokenizer.batch_decode(batch.batch['responses'], skip_special_tokens=False)
@@ -371,7 +427,7 @@ class TrajectoryCollector:
             # 初始化 action 分布
             action_dist = np.zeros((batch_size, 4), dtype=np.int32)  #Motion+Grounding,  Motion, Grounding, Action
             for i, ta in enumerate(text_actions):
-                thought = ta["thought"]
+                thought = ta.get("thought", "") if isinstance(ta, dict) else str(ta)
                 # 统计出现次数（只扫一次）
                 motion_count = thought.count("Motion:")
                 grounding_count = thought.count("Grounding:")
@@ -443,6 +499,13 @@ class TrajectoryCollector:
                     episode_rewards=episode_rewards, 
                     episode_lengths=episode_lengths,
                     )
+        episode_rewards = self._apply_failure_ranking(
+            total_batch_list=total_batch_list,
+            total_infos=total_infos,
+            episode_rewards=episode_rewards,
+            episode_lengths=episode_lengths,
+            success=success,
+        )
         
         return total_batch_list, episode_rewards, episode_lengths, success, traj_uid
     
@@ -495,7 +558,7 @@ class TrajectoryCollector:
             if isinstance(resp, torch.Tensor):
                 resp = resp.detach().cpu().numpy()  # 转为 numpy 数组
                 if len(resp.shape) > 1 and resp.shape[0] > 1:
-                    breakpoint()
+                    resp = resp[0]
                 resp = resp.flatten()
                 return tokenizer.decode(resp, skip_special_tokens=False)
 
@@ -689,7 +752,15 @@ class TrajectoryCollector:
                     except Exception as e:
                         import traceback
                         traceback.print_exc()
-                        breakpoint()        
+                        is_done[env_id] = True
+                        total_infos[env_id].append({
+                            "error": repr(e),
+                            "infra_error": True,
+                            "won": False,
+                            "task_name": "",
+                            "task_description": "",
+                        })
+                        continue
                     # —— 环境单步
                     next_obs, reward, done, info = envs.step_one(env_id, text_action)
 
@@ -855,6 +926,13 @@ class TrajectoryCollector:
             episode_rewards=episode_rewards,
             episode_lengths=episode_lengths,
         )
+        episode_rewards = self._apply_failure_ranking(
+            total_batch_list=total_batch_list,
+            total_infos=total_infos,
+            episode_rewards=episode_rewards,
+            episode_lengths=episode_lengths,
+            success=success,
+        )
         print("rollout_finished, env_nums:", batch_size, "max_steps:", self.config.env.max_steps)
         return total_batch_list, episode_rewards, episode_lengths, success, traj_uid, finished_ratio
 
@@ -906,7 +984,6 @@ class TrajectoryCollector:
                 actor_rollout_wg=actor_rollout_wg,
                 envs=envs,
             )
-            
             if self.config.algorithm.filter_groups.enable:
                 batch_list, episode_rewards, episode_lengths, success, traj_uid = filter_group_data(batch_list=batch_list,
                                                                                                     episode_rewards=episode_rewards, 
@@ -949,6 +1026,15 @@ class TrajectoryCollector:
         Returns:
             DataProto: Final collected trajectory data with metadata.
         """
+        algorithm = getattr(self.config, "algorithm", None)
+        sfr_config = (
+            algorithm.get("sfr", {})
+            if algorithm is not None and hasattr(algorithm, "get")
+            else {}
+        )
+        self._sfr_active = bool(is_train and sfr_config.get("enabled", False))
+        self._sfr_metrics = {}
+
         # Initial observations from the environment
         print("1111")
         if (self.config.algorithm.dynamic_rollouts or self.config.algorithm.filter_groups.enable) and is_train:
@@ -987,5 +1073,7 @@ class TrajectoryCollector:
         gen_batch_output.meta_info['avg_length'] = np.mean(total_episode_lengths)
         gen_batch_output.meta_info['traj_level_batch_size'] = len(total_batch_list)
         gen_batch_output.meta_info['step_level_batch_size'] = gen_batch_output.batch['input_ids'].shape[0]
+        if self._sfr_active:
+            gen_batch_output.meta_info.update(self._sfr_metrics)
         
         return gen_batch_output, finished_ratio

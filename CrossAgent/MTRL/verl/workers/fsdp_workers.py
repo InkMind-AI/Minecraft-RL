@@ -77,6 +77,18 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
 
+
+def _get_attention_implementation() -> str:
+    """Use FlashAttention when installed, otherwise Transformers SDPA."""
+    try:
+        from transformers.utils import is_flash_attn_2_available
+
+        if is_flash_attn_2_available():
+            return "flash_attention_2"
+    except ImportError:
+        pass
+    return "sdpa"
+
 @contextmanager
 def _timer(name: str, timing_raw: Dict[str, float]):
     """Context manager for timing code execution.
@@ -205,7 +217,13 @@ class ActorRolloutRefWorker(Worker):
         from torch import optim
         from torch.distributed.fsdp import CPUOffload, MixedPrecision
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-        from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForVision2Seq
+        from transformers import AutoConfig, AutoModelForCausalLM
+        try:
+            from transformers import AutoModelForVision2Seq
+        except ImportError:
+            # Transformers 5 renamed this auto class. Keep the local alias so
+            # the model-selection logic below works on both API generations.
+            from transformers import AutoModelForImageTextToText as AutoModelForVision2Seq
 
         from verl.utils.model import get_generation_config, print_model_size, update_model_config
         from verl.utils.torch_dtypes import PrecisionType
@@ -227,7 +245,11 @@ class ActorRolloutRefWorker(Worker):
             torch_dtype = PrecisionType.to_dtype(torch_dtype)
 
         # override model kwargs
-        actor_model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code, attn_implementation="flash_attention_2")
+        actor_model_config = AutoConfig.from_pretrained(
+            local_path,
+            trust_remote_code=trust_remote_code,
+            attn_implementation=_get_attention_implementation(),
+        )
                 
         # patch for kimi-vl
         if getattr(actor_model_config, "model_type", None) == "kimi_vl":
@@ -891,7 +913,11 @@ class CriticWorker(Worker):
 
         from transformers import AutoConfig, AutoModelForTokenClassification
 
-        critic_model_config = AutoConfig.from_pretrained(local_path, attn_implementation="flash_attention_2", trust_remote_code=config.model.get("trust_remote_code", False))
+        critic_model_config = AutoConfig.from_pretrained(
+            local_path,
+            attn_implementation=_get_attention_implementation(),
+            trust_remote_code=config.model.get("trust_remote_code", False),
+        )
         critic_model_config.num_labels = 1
         # patch for kimi-vl
         if getattr(critic_model_config, "model_type", None) == "kimi_vl":
@@ -1215,7 +1241,7 @@ class RewardModelWorker(Worker):
                 pretrained_model_name_or_path=local_path,
                 config=model_config,
                 torch_dtype=torch.bfloat16,
-                attn_implementation="flash_attention_2",
+                attn_implementation=_get_attention_implementation(),
                 trust_remote_code=trust_remote_code,
             )
 
@@ -1488,4 +1514,3 @@ class AsyncActorRolloutRefWorker(ActorRolloutRefWorker):
 from verl.single_controller.base.decorator import MAGIC_ATTR
 attr = getattr(ActorRolloutRefWorker.generate_sequences, MAGIC_ATTR)
 print(attr)
-

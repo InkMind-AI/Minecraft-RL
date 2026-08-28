@@ -1,28 +1,50 @@
 set -x
 ENGINE=${1:-vllm}
+shift || true
 export VLLM_ATTENTION_BACKEND=XFORMERS
 
-train_data_size=1
-val_data_size=1
-group_size=1
+train_data_size=${TRAIN_DATA_SIZE:-1}
+val_data_size=${VAL_DATA_SIZE:-1}
+data_root=${DATA_ROOT:-$HOME/data/verl-agent}
+data_dir=$data_root/text
+model_path=${MODEL_PATH:-/share_data/limuyao/checkpoints/train/mc-openha-state2-qwen2-vl-7b-250830-A800-e1-b4-a1/checkpoints/global_step_300/hf_ckpt}
+task_path=${TASK_PATH:-../STRL/data_processor/utils/task_list.json}
+prepare_data=${PREPARE_DATA:-True}
+group_size=${GROUP_SIZE:-4}
+sfr_enabled=${SFR_ENABLED:-False}
+sfr_mode=${SFR_MODE:-sfr}
+sfr_model_endpoint=${SFR_MODEL_ENDPOINT:-}
+sfr_model_name=${SFR_MODEL_NAME:-}
+sfr_model_fallback=${SFR_MODEL_FALLBACK:-abstain}
 
 project_name='verl_agent_minecraft_dynamicsampling'
 experiment_name='grpo'
 # We only use data preparation to indicate the modality and the data size.
-python3 -m examples.data_preprocess.prepare \
-    --mode 'text' \
-    --train_data_size $train_data_size \
-    --val_data_size $val_data_size
+if [[ "$prepare_data" == "True" || "$prepare_data" == "true" || "$prepare_data" == "1" ]]; then
+    python3 -m examples.data_preprocess.prepare \
+        --mode 'text' \
+        --local_dir "$data_root" \
+        --train_data_size "$train_data_size" \
+        --val_data_size "$val_data_size"
+fi
 
 
 #/share_data/limuyao/checkpoints/train/mc-coa-craft-qwen2-vl-7b-250725-A800-c32-e1-b8-a1/checkpoint-2998 \
 RAY_DEBUG=legacy python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     algorithm.filter_groups.enable=False \
+    algorithm.sfr.enabled=$sfr_enabled \
+    algorithm.sfr.mode=$sfr_mode \
+    algorithm.sfr.beta=${SFR_BETA:-0.2} \
+    algorithm.sfr.quality_epsilon=${SFR_EPSILON:-0.02} \
+    algorithm.sfr.random_seed=${SFR_SEED:-0} \
+    algorithm.sfr.model.endpoint=$sfr_model_endpoint \
+    algorithm.sfr.model.model_name=$sfr_model_name \
+    algorithm.sfr.model.fallback=$sfr_model_fallback \
     algorithm.dynamic_rollouts=True \
     algorithm.filter_groups.max_num_gen_batches=4 \
-    data.train_files=$HOME/data/verl-agent/text/train.parquet \
-    data.val_files=$HOME/data/verl-agent/text/test.parquet \
+    data.train_files=$data_dir/train.parquet \
+    data.val_files=$data_dir/test.parquet \
     data.train_batch_size=$train_data_size \
     data.val_batch_size=$val_data_size \
     data.max_prompt_length=2048 \
@@ -30,7 +52,7 @@ RAY_DEBUG=legacy python3 -m verl.trainer.main_ppo \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     data.return_raw_chat=True \
-    actor_rollout_ref.model.path=/share_data/limuyao/checkpoints/train/mc-openha-state2-qwen2-vl-7b-250830-A800-e1-b4-a1/checkpoints/global_step_300/hf_ckpt\
+    actor_rollout_ref.model.path=$model_path \
     actor_rollout_ref.actor.optim.lr=5e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=128 \
@@ -57,8 +79,8 @@ RAY_DEBUG=legacy python3 -m verl.trainer.main_ppo \
     algorithm.use_kl_in_reward=False \
     env.env_name=minecraft \
     env.seed=0 \
-    env.task_path=OpenHA/rl/data_processor/utils/task_list.json \
-    env.record_path=MC-verl-agent/examples/grpo_trainer/output/videos/${project_name}/${experiment_name} \
+    env.task_path=$task_path \
+    env.rollout_path=MC-verl-agent/examples/grpo_trainer/output/videos/${project_name}/${experiment_name} \
     env.maximum_history_length=5 \
     env.max_steps=192 \
     env.rollout.n=$group_size \
@@ -67,12 +89,15 @@ RAY_DEBUG=legacy python3 -m verl.trainer.main_ppo \
     trainer.project_name=${project_name} \
     trainer.experiment_name=${experiment_name} \
     trainer.default_local_dir=checkpoints/${project_name}/${experiment_name} \
-    trainer.n_gpus_per_node=8 \
+    trainer.n_gpus_per_node=${N_GPUS:-2} \
     trainer.nnodes=1 \
     trainer.save_freq=10 \
     trainer.test_freq=10 \
     trainer.total_epochs=150 \
-    trainer.val_before_train=False $@
+    trainer.val_before_train=False "$@"
+
+train_exit_code=$?
 
 echo "========== Checking dmesg for killed processes =========="
-dmesg -T | grep -i kill
+dmesg -T 2>/dev/null | grep -i kill || true
+exit $train_exit_code

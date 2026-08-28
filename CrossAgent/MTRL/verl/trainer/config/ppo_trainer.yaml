@@ -253,6 +253,35 @@ algorithm:
   filter_groups: # DAPO from https://arxiv.org/abs/2503.14476
     enable: False
     max_num_gen_batches: 10
+  sfr:
+    # SFR is opt-in. Disabled means the original sparse episode reward path.
+    enabled: False
+    # sparse | sfr | random_rank | absolute_q | length_rank | model_rank
+    mode: sfr
+    beta: 0.2
+    quality_epsilon: 0.02
+    random_seed: 0
+    feature_weights:
+      event: 0.30
+      inventory: 0.25
+      validity: 0.15
+      survival: 0.15
+      noop: 0.05
+      loop: 0.05
+      death: 0.10
+      timeout: 0.05
+    model:
+      # OpenAI-compatible endpoint, for example http://127.0.0.1:8000/v1
+      endpoint: null
+      model_name: null
+      api_key_env: OPENAI_API_KEY
+      timeout_seconds: 30
+      max_tokens: 128
+      max_prompt_chars: 12000
+      temperature: 0.0
+      confidence_threshold: 0.0
+      # abstain keeps the original reward; rule falls back to rule q.
+      fallback: abstain
 
 trainer:
   balance_batch: True
