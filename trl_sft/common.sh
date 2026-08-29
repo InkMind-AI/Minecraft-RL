@@ -12,6 +12,15 @@ NODE_RANK="${NODE_RANK:-0}"
 MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 MASTER_PORT="${MASTER_PORT:-29400}"
 ATTN_IMPL="${ATTN_IMPL:-sdpa}"
+# Opt-in: install causal-conv1d + flash-linear-attention so Qwen3.5's 24/32
+# "linear_attention" (Gated DeltaNet) layers get their fused-kernel implementation
+# instead of transformers' pure-PyTorch fallback. Benchmarked on this exact image/GPU
+# (H200, torch 2.6.0+cu124): chunk_gated_delta_rule at T=4096 went from 18.11ms/call
+# (fallback) to 0.74ms/call (fla) -- ~24.5x on that op alone. flash_attention_2 (the
+# --attn-impl flag above) only accelerates the OTHER 8/32 "full_attention" layers, so
+# the two flags are complementary, not redundant. No effect on Qwen2-VL (no linear
+# attention layers at all) -- harmless to pass but unnecessary.
+LINEAR_ATTN_KERNELS="${LINEAR_ATTN_KERNELS:-0}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -23,6 +32,7 @@ while [[ $# -gt 0 ]]; do
         --master-addr) MASTER_ADDR="$2"; shift 2 ;;
         --master-port) MASTER_PORT="$2"; shift 2 ;;
         --attn-impl) ATTN_IMPL="$2"; shift 2 ;;
+        --linear-attn-kernels) LINEAR_ATTN_KERNELS="1"; shift ;;
         *) echo "Unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -95,6 +105,21 @@ bootstrap_env() {
     if [ "$ATTN_IMPL" = "flash_attention_2" ]; then
         python -c "import flash_attn" 2>/dev/null || \
             pip_retry -q flash-attn==2.7.4.post1 --no-build-isolation
+    fi
+    # See LINEAR_ATTN_KERNELS comment above for what/why. Both packages need torch
+    # already importable (checked above) since their setup.py links against it.
+    # causal-conv1d's PyPI wheel is ABI-incompatible with this image's torch build
+    # (confirmed: import-time "undefined symbol: ...torchCheckFail..."), exactly like
+    # flash-attn above -- CAUSAL_CONV1D_FORCE_BUILD=TRUE forces a from-source build
+    # against the already-installed torch instead of pulling that broken wheel.
+    # flash-linear-attention is pure Triton (no CUDA extension to compile), so a plain
+    # pip install is sufficient and fast.
+    if [ "$LINEAR_ATTN_KERNELS" = "1" ]; then
+        pip_retry -q ninja packaging wheel setuptools
+        python -c "import causal_conv1d" 2>/dev/null || \
+            CAUSAL_CONV1D_FORCE_BUILD=TRUE pip_retry -q --no-build-isolation causal-conv1d
+        python -c "import fla" 2>/dev/null || \
+            pip_retry -q flash-linear-attention
     fi
 }
 

@@ -58,7 +58,6 @@ import logging
 import os
 import shutil
 import subprocess
-import sys
 from dataclasses import fields as dataclass_fields
 from pathlib import Path
 from typing import Dict, Optional
@@ -160,7 +159,12 @@ def _build_dataset(args, processor):
 def _setup_collator(trainer, args, processor):
     """Set the appropriate data collator on the trainer."""
     if args.full_trajectory:
-        trainer.data_collator = MultiStepVLMCollator(processor=processor, max_length=args.max_seq_length)
+        trainer.data_collator = MultiStepVLMCollator(
+            processor=processor,
+            max_length=args.max_seq_length,
+            focal_decay=args.focal_decay,
+            focal_seed=args.seed,
+        )
     elif not args.text_only:
         trainer.data_collator = ImmutableVisionCollatorAdapter(trainer.data_collator)
 
@@ -341,6 +345,19 @@ def main():
         "history window) and train on EVERY assistant 'Action: ...' turn via "
         "MultiStepVLMCollator, instead of only the last turn. Requires --max_seq_length "
         "large enough to hold a full trajectory (e.g. 19456).",
+    )
+    parser.add_argument(
+        "--focal_decay",
+        type=float,
+        default=0.75,
+        help="Focal repeat suppression for --full_trajectory (VeOmni's "
+        "`qwen2_5vlwithfocal` mechanism, the one its published TextVLA runs used). "
+        "Within a trajectory, an assistant turn whose text is identical to the previous "
+        "one decays alpha *= focal_decay and is dropped from the loss with probability "
+        "1 - alpha; a changed action resets alpha to 1.0 and is always kept. Counters "
+        "the measured 56%% consecutive-repeat / 37%% pure-no-op rate of "
+        "minecraft-text-action-dataset, which otherwise collapses checkpoints into "
+        "always emitting 'move(0, 0) and press()'. Use 1.0 to disable.",
     )
     parser.add_argument("--max_seq_length", type=int, default=16384)
     parser.add_argument("--per_device_batch_size", type=int, default=2)

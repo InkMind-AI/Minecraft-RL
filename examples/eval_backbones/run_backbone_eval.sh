@@ -63,6 +63,27 @@ export GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.90}
 export TP_SIZE=${TP_SIZE:-1}
 export GPU_PER_ROLLOUT=${GPU_PER_ROLLOUT:-0.1}
 export VLLM_PORT=${VLLM_PORT:-11000}
+# Passed through to rollout_openha.py -> OpenHA(**kwargs) -> VLMClient(extra_body=...)
+# -> the OpenAI-compatible `chat.completions.create(extra_body=...)` call, which vLLM
+# forwards into `tokenizer.apply_chat_template(..., **chat_template_kwargs)`.
+#
+# Qwen3.5's chat template defaults to `enable_thinking=True`, wrapping every response
+# in a `<think>...</think>` block. Training (trl_sft/dataset.py's
+# `_resolve_chat_template_kwargs`) renders with `enable_thinking=False` (needed there
+# to keep the prompt a token-for-token prefix of prompt+completion -- see that
+# function's own comment), so at eval time the model is being asked to continue a
+# rendering it never saw, and it leaks `</think>` fragments / stray natural-language
+# text into `raw_action` instead of a clean "Action: ..." line (confirmed on real
+# eval-q35-focal-ckpt400 rollouts: "</think>\n\nAction: ..." and "The cat is not
+# visible in the screenshot." polluting the action stream). Default this to match
+# training whenever VLLM_CONDA_ENV isn't the plain Qwen2-VL env (currently the only
+# other env, `vllm35`, is exclusively used for Qwen3.5); override per-model with
+# EXTRA_BODY_JSON=... if a future architecture needs something different.
+if [ "${VLLM_CONDA_ENV}" = "openha" ]; then
+    export EXTRA_BODY_JSON=${EXTRA_BODY_JSON:-'{}'}
+else
+    export EXTRA_BODY_JSON=${EXTRA_BODY_JSON:-'{"chat_template_kwargs": {"enable_thinking": false}}'}
+fi
 
 REPO_ROOT="${REPO_ROOT:-/data/work/run_codes}"
 LOCAL_MODEL_DIR="/local-ssd/models/${MODEL_LOCAL_NAME}"
@@ -178,14 +199,49 @@ if ! python -c "from cuda import cuda, cudart" >/dev/null 2>&1; then
 fi
 # MineStudio首次运行会交互式询问是否下载模拟器引擎(Y/N)，在非交互 job 里会直接 EOFError。
 # 提前非交互下载好，避免 rollout 阶段卡死。
+#
+# 优先从我们自己镜像的 S3 拷贝拉取（engine.zip, ~440MB），不再依赖 HF Hub：
+# HF Hub 对 CraftJarvis/SimulatorEngine 的匿名下载有速率限制（真实撞过 429），
+# 一旦 setup 阶段这里失败而未被拦截，后续每个 rollout worker 各自触发上面那个
+# 交互式 Y/N 提示、EOFError 崩溃，最终 0 个 rollout 产出，job 判定失败——
+# 这正是两次真实评测任务失败的原因。S3 镜像从根本上消除了对 HF 限流的依赖；
+# 仅当 S3 镜像也拿不到时才回退 HF（带重试），且重试仍失败则直接 exit 1，
+# 不再静默放行到必崩的状态。
+ENGINE_MIRROR_S3_URI="s3://arcwm-code-us-west-2/axiom/assets/minestudio/engine.zip"
 if ! python -c "
 import os
 from minestudio.utils import get_mine_studio_dir
 jar = os.path.join(get_mine_studio_dir(), 'engine', 'build', 'libs', 'mcprec-6.13.jar')
 assert os.path.exists(jar)
 " >/dev/null 2>&1; then
-    echo "[setup] downloading MineStudio simulator engine to ${MINESTUDIO_DIR}"
-    python -c "from minestudio.simulator.entry import download_engine; download_engine()"
+    MINESTUDIO_DIR_RESOLVED="${MINESTUDIO_DIR:-$(python -c 'from minestudio.utils import get_mine_studio_dir; print(get_mine_studio_dir())')}"
+    mkdir -p "${MINESTUDIO_DIR_RESOLVED}"
+    if aws s3 cp "${ENGINE_MIRROR_S3_URI}" "${MINESTUDIO_DIR_RESOLVED}/engine.zip" --only-show-errors; then
+        echo "[setup] downloaded MineStudio simulator engine from S3 mirror, extracting..."
+        python -c "
+import os, zipfile
+d = '${MINESTUDIO_DIR_RESOLVED}'
+with zipfile.ZipFile(os.path.join(d, 'engine.zip'), 'r') as z:
+    z.extractall(d)
+os.remove(os.path.join(d, 'engine.zip'))
+"
+    else
+        echo "[setup] S3 mirror unavailable, falling back to HuggingFace (with retry)"
+        for attempt in 1 2 3 4 5; do
+            python -c "from minestudio.simulator.entry import download_engine; download_engine()" && break
+            echo "[retry] download_engine() failed (attempt ${attempt}/5, likely HF Hub rate-limit), retrying in 20s..." >&2
+            sleep 20
+        done
+    fi
+    if ! python -c "
+import os
+from minestudio.utils import get_mine_studio_dir
+jar = os.path.join(get_mine_studio_dir(), 'engine', 'build', 'libs', 'mcprec-6.13.jar')
+assert os.path.exists(jar)
+" >/dev/null 2>&1; then
+        echo "[setup][FATAL] simulator engine still missing after S3 mirror + HF fallback both failed, aborting (would otherwise silently produce 0 rollout results)" >&2
+        exit 1
+    fi
 fi
 echo "[setup] openha env ready: $(python -c 'import torch,vllm; print(f"torch={torch.__version__} vllm={vllm.__version__}")')"
 
@@ -219,7 +275,23 @@ fi
 # ---------------------------------------------------------------------------
 if [ ! -f "${LOCAL_MODEL_DIR}/config.json" ]; then
     echo "[download] syncing ${MODEL_S3_URI} -> ${LOCAL_MODEL_DIR}"
-    aws s3 sync "${MODEL_S3_URI%/}/" "${LOCAL_MODEL_DIR}/" --no-progress
+    # Exclude checkpoint-*/ subdirectories: when MODEL_S3_URI points at a full
+    # trl_sft --output_dir (e.g. a Stage II run dir used directly as an eval
+    # baseline), it contains BOTH the final merged model at the root (everything
+    # vLLM actually reads) AND every intermediate --save_steps checkpoint -- a full
+    # DeepSpeed ZeRO checkpoint with per-rank optimizer states, ~5-8x the plain
+    # model size EACH (verified: one real dir was ~800GB across 6 checkpoints vs.
+    # 16.5GB of actual model weights). Mirrors train_sft.py's
+    # download_from_s3(exclude_checkpoints=True) for the same reason.
+    #
+    # Also exclude global_step*/ : when MODEL_S3_URI instead points directly at ONE
+    # checkpoint-N/ dir (e.g. evaluating a specific in-progress training step), the
+    # merged fp32 weights (model.safetensors) sit at ITS root, but DeepSpeed also
+    # writes a global_stepN/ subdir with the raw per-rank optimizer+model shards --
+    # verified 116GB there vs. 16.5GB of actual model weights for one real
+    # checkpoint-200/.
+    aws s3 sync "${MODEL_S3_URI%/}/" "${LOCAL_MODEL_DIR}/" --no-progress \
+        --exclude 'checkpoint-*/*' --exclude 'global_step*/*'
 else
     echo "[download] model already present at ${LOCAL_MODEL_DIR}, skip"
 fi
@@ -437,6 +509,7 @@ if [ -n "${TASK_DIFFICULTY_LIST}" ]; then
             --fps "${FPS}" \
             --gpu_per_rollout "${GPU_PER_ROLLOUT}" \
             --num_rollouts "${ROLLOUTS_PER_TASK}" \
+            --extra_body "${EXTRA_BODY_JSON}" \
             2>&1 | tee -a "${LOG_DIR}/rollout_${TASK//[:,]/_}.log"
     done
 else
@@ -463,6 +536,7 @@ else
             --fps "${FPS}" \
             --gpu_per_rollout "${GPU_PER_ROLLOUT}" \
             --num_rollouts "${ROLLOUTS_PER_TASK}" \
+            --extra_body "${EXTRA_BODY_JSON}" \
             2>&1 | tee -a "${LOG_DIR}/rollout_${TASK//[:,]/_}.log"
     done
 fi

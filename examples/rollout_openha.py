@@ -96,6 +96,7 @@ def rollout(args):
         top_p = args.top_p,
         grounding_inference_interval = args.grounding_inference_interval,
         motion_inference_interval = args.motion_inference_interval,
+        extra_body = args.extra_body,
     )
     
     # Sleep randomly to avoid contention when launching multiple rollouts in parallel
@@ -228,7 +229,19 @@ if __name__ == '__main__':
     parser.add_argument('--top_p',type=float, default=0.99)
     parser.add_argument('--top_k',type=int, default=-1)
     parser.add_argument('--gpu_per_rollout',type=float, default=0.5)
+    parser.add_argument(
+        "--extra_body",
+        type=str,
+        default="{}",
+        help="JSON-encoded dict forwarded to VLMClient(extra_body=...) -> the OpenAI "
+        "chat.completions.create(extra_body=...) call -> vLLM's "
+        "tokenizer.apply_chat_template(**chat_template_kwargs). E.g. "
+        '\'{"chat_template_kwargs": {"enable_thinking": false}}\' to match how '
+        "trl_sft/dataset.py renders training data for Qwen3.x models (see "
+        "run_backbone_eval.sh's EXTRA_BODY_JSON for why this matters at eval time).",
+    )
     args = parser.parse_args()
+    args.extra_body = json.loads(args.extra_body)
     
     # Multi-rollout mode with Ray
     if args.num_rollouts > 1:

@@ -35,7 +35,19 @@ trl==1.10.0
 # split_dataset_by_node call in train_sft.py or each process will be sharded twice.
 datasets==5.0.1
 accelerate==1.14.0
-deepspeed>=0.15.0
+# PINNED EXACTLY: deepspeed>=0.15.0 (an open range) resolved to 0.19.6 (released
+# 2026-08-27 19:08 UTC) on two real 8-GPU jobs submitted the next day, which crashes
+# at `import deepspeed` itself -- deepspeed/compile/custom_ops/tp_collectives.py
+# registers a `@torch.library.custom_op` with a `partition_sizes: list[int]`
+# parameter, and this torch build's `infer_schema` rejects that type annotation
+# (ValueError: "Parameter partition_sizes has unsupported type list[int]"), before
+# any of our training code ever runs. A third 8-GPU job submitted ~17h earlier (same
+# day 0.19.6 was cut, just minutes after its release) resolved to an OLDER cached
+# deepspeed and ran fine -- i.e. this is exactly the same "unpinned range resolves to
+# a different release depending on job-submission timing" failure mode already
+# described above for transformers/trl. 0.19.5 (released 2026-08-10, the release
+# immediately before 0.19.6) is the newest version confirmed NOT to hit this.
+deepspeed==0.19.5
 # Optional: --attn_implementation defaults to "sdpa" (no extra install). flash-attn's
 # prebuilt wheel was confirmed ABI-incompatible with the koala training image's torch
 # build (import-time "undefined symbol"), and building from source needs

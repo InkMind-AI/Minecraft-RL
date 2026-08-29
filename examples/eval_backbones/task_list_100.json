@@ -1,0 +1,497 @@
+[
+  {
+    "category": "Embodied",
+    "task": "mine_block:cobweb",
+    "difficulty": "easy"
+  },
+  {
+    "category": "Embodied",
+    "task": "mine_block:allium",
+    "difficulty": "middle"
+  },
+  {
+    "category": "Embodied",
+    "task": "mine_block:lily_of_the_valley",
+    "difficulty": "hard"
+  },
+  {
+    "category": "Embodied",
+    "task": "mine_block:iron_ore",
+    "difficulty": "easy"
+  },
+  {
+    "category": "Embodied",
+    "task": "mine_block:gravel",
+    "difficulty": "middle"
+  },
+  {
+    "category": "Embodied",
+    "task": "mine_block:crying_obsidian",
+    "difficulty": "hard"
+  },
+  {
+    "category": "Embodied",
+    "task": "mine_block:coal_ore",
+    "difficulty": "easy"
+  },
+  {
+    "category": "Embodied",
+    "task": "mine_block:wheat",
+    "difficulty": "middle"
+  },
+  {
+    "category": "Embodied",
+    "task": "mine_block:cauldron",
+    "difficulty": "hard"
+  },
+  {
+    "category": "Embodied",
+    "task": "mine_block:rose_bush",
+    "difficulty": "easy"
+  },
+  {
+    "category": "Embodied",
+    "task": "mine_block:azure_bluet",
+    "difficulty": "middle"
+  },
+  {
+    "category": "Embodied",
+    "task": "mine_block:andesite",
+    "difficulty": "hard"
+  },
+  {
+    "category": "Embodied",
+    "task": "mine_block:chest",
+    "difficulty": "easy"
+  },
+  {
+    "category": "Embodied",
+    "task": "mine_block:grass",
+    "difficulty": "middle"
+  },
+  {
+    "category": "Embodied",
+    "task": "mine_block:grindstone",
+    "difficulty": "hard"
+  },
+  {
+    "category": "Embodied",
+    "task": "mine_block:stonecutter",
+    "difficulty": "easy"
+  },
+  {
+    "category": "Embodied",
+    "task": "mine_block:yellow_terracotta",
+    "difficulty": "middle"
+  },
+  {
+    "category": "Embodied",
+    "task": "mine_block:furnace",
+    "difficulty": "hard"
+  },
+  {
+    "category": "Embodied",
+    "task": "mine_block:redstone_torch",
+    "difficulty": "easy"
+  },
+  {
+    "category": "Embodied",
+    "task": "mine_block:grass_block",
+    "difficulty": "middle"
+  },
+  {
+    "category": "Embodied",
+    "task": "mine_block:smoker",
+    "difficulty": "hard"
+  },
+  {
+    "category": "Embodied",
+    "task": "mine_block:lily_pad",
+    "difficulty": "easy"
+  },
+  {
+    "category": "Embodied",
+    "task": "mine_block:acacia_leaves",
+    "difficulty": "middle"
+  },
+  {
+    "category": "Embodied",
+    "task": "mine_block:dark_oak_log",
+    "difficulty": "hard"
+  },
+  {
+    "category": "Embodied",
+    "task": "mine_block:white_stained_glass_pane",
+    "difficulty": "easy"
+  },
+  {
+    "category": "Embodied",
+    "task": "mine_block:obsidian",
+    "difficulty": "middle"
+  },
+  {
+    "category": "Embodied",
+    "task": "mine_block:yellow_bed",
+    "difficulty": "hard"
+  },
+  {
+    "category": "Embodied",
+    "task": "mine_block:cactus",
+    "difficulty": "easy"
+  },
+  {
+    "category": "Embodied",
+    "task": "mine_block:cobblestone",
+    "difficulty": "middle"
+  },
+  {
+    "category": "Embodied",
+    "task": "mine_block:spruce_stairs",
+    "difficulty": "hard"
+  },
+  {
+    "category": "Embodied",
+    "task": "mine_block:potted_cactus",
+    "difficulty": "easy"
+  },
+  {
+    "category": "Embodied",
+    "task": "mine_block:dead_bush",
+    "difficulty": "middle"
+  },
+  {
+    "category": "Embodied",
+    "task": "mine_block:birch_log",
+    "difficulty": "hard"
+  },
+  {
+    "category": "Combat",
+    "task": "kill_entity:cod",
+    "difficulty": "easy"
+  },
+  {
+    "category": "Combat",
+    "task": "kill_entity:pig",
+    "difficulty": "middle"
+  },
+  {
+    "category": "Combat",
+    "task": "kill_entity:cow",
+    "difficulty": "hard"
+  },
+  {
+    "category": "Combat",
+    "task": "kill_entity:parrot",
+    "difficulty": "easy"
+  },
+  {
+    "category": "Combat",
+    "task": "kill_entity:wither",
+    "difficulty": "middle"
+  },
+  {
+    "category": "Combat",
+    "task": "kill_entity:stray",
+    "difficulty": "hard"
+  },
+  {
+    "category": "Combat",
+    "task": "kill_entity:horse",
+    "difficulty": "easy"
+  },
+  {
+    "category": "Combat",
+    "task": "kill_entity:cat",
+    "difficulty": "middle"
+  },
+  {
+    "category": "Combat",
+    "task": "kill_entity:ravager",
+    "difficulty": "hard"
+  },
+  {
+    "category": "Combat",
+    "task": "kill_entity:skeleton_horse",
+    "difficulty": "easy"
+  },
+  {
+    "category": "Combat",
+    "task": "kill_entity:creeper",
+    "difficulty": "middle"
+  },
+  {
+    "category": "Combat",
+    "task": "kill_entity:zombie",
+    "difficulty": "hard"
+  },
+  {
+    "category": "Combat",
+    "task": "kill_entity:zombie_villager",
+    "difficulty": "easy"
+  },
+  {
+    "category": "Combat",
+    "task": "kill_entity:slime",
+    "difficulty": "middle"
+  },
+  {
+    "category": "Combat",
+    "task": "kill_entity:iron_golem",
+    "difficulty": "hard"
+  },
+  {
+    "category": "Combat",
+    "task": "kill_entity:phantom",
+    "difficulty": "easy"
+  },
+  {
+    "category": "Combat",
+    "task": "kill_entity:evoker",
+    "difficulty": "middle"
+  },
+  {
+    "category": "Combat",
+    "task": "kill_entity:chicken",
+    "difficulty": "hard"
+  },
+  {
+    "category": "Combat",
+    "task": "kill_entity:bee",
+    "difficulty": "easy"
+  },
+  {
+    "category": "Combat",
+    "task": "kill_entity:ocelot",
+    "difficulty": "middle"
+  },
+  {
+    "category": "Combat",
+    "task": "kill_entity:vindicator",
+    "difficulty": "hard"
+  },
+  {
+    "category": "Combat",
+    "task": "kill_entity:squid",
+    "difficulty": "easy"
+  },
+  {
+    "category": "Combat",
+    "task": "kill_entity:donkey",
+    "difficulty": "middle"
+  },
+  {
+    "category": "Combat",
+    "task": "kill_entity:vex",
+    "difficulty": "hard"
+  },
+  {
+    "category": "Combat",
+    "task": "kill_entity:rabbit",
+    "difficulty": "easy"
+  },
+  {
+    "category": "Combat",
+    "task": "kill_entity:cave_spider",
+    "difficulty": "middle"
+  },
+  {
+    "category": "Combat",
+    "task": "kill_entity:silverfish",
+    "difficulty": "hard"
+  },
+  {
+    "category": "Combat",
+    "task": "kill_entity:dolphin",
+    "difficulty": "easy"
+  },
+  {
+    "category": "Combat",
+    "task": "kill_entity:ghast",
+    "difficulty": "middle"
+  },
+  {
+    "category": "Combat",
+    "task": "kill_entity:enderman",
+    "difficulty": "hard"
+  },
+  {
+    "category": "Combat",
+    "task": "kill_entity:spider",
+    "difficulty": "easy"
+  },
+  {
+    "category": "Combat",
+    "task": "kill_entity:llama",
+    "difficulty": "middle"
+  },
+  {
+    "category": "Combat",
+    "task": "kill_entity:husk",
+    "difficulty": "hard"
+  },
+  {
+    "category": "GUI",
+    "task": "craft_item:golden_leggings",
+    "difficulty": "easy"
+  },
+  {
+    "category": "GUI",
+    "task": "craft_item:jungle_planks",
+    "difficulty": "middle"
+  },
+  {
+    "category": "GUI",
+    "task": "craft_item:brown_banner",
+    "difficulty": "hard"
+  },
+  {
+    "category": "GUI",
+    "task": "craft_item:diorite_stairs",
+    "difficulty": "easy"
+  },
+  {
+    "category": "GUI",
+    "task": "craft_item:trapped_chest",
+    "difficulty": "middle"
+  },
+  {
+    "category": "GUI",
+    "task": "craft_item:iron_axe",
+    "difficulty": "hard"
+  },
+  {
+    "category": "GUI",
+    "task": "craft_item:diamond_chestplate",
+    "difficulty": "easy"
+  },
+  {
+    "category": "GUI",
+    "task": "craft_item:repeater",
+    "difficulty": "middle"
+  },
+  {
+    "category": "GUI",
+    "task": "craft_item:paper",
+    "difficulty": "hard"
+  },
+  {
+    "category": "GUI",
+    "task": "craft_item:jungle_slab",
+    "difficulty": "easy"
+  },
+  {
+    "category": "GUI",
+    "task": "craft_item:white_terracotta",
+    "difficulty": "middle"
+  },
+  {
+    "category": "GUI",
+    "task": "craft_item:gray_carpet",
+    "difficulty": "hard"
+  },
+  {
+    "category": "GUI",
+    "task": "craft_item:magenta_stained_glass",
+    "difficulty": "easy"
+  },
+  {
+    "category": "GUI",
+    "task": "craft_item:blue_stained_glass_pane",
+    "difficulty": "middle"
+  },
+  {
+    "category": "GUI",
+    "task": "craft_item:green_carpet",
+    "difficulty": "hard"
+  },
+  {
+    "category": "GUI",
+    "task": "craft_item:birch_stairs",
+    "difficulty": "easy"
+  },
+  {
+    "category": "GUI",
+    "task": "craft_item:lime_wool",
+    "difficulty": "middle"
+  },
+  {
+    "category": "GUI",
+    "task": "craft_item:polished_blackstone_pressure_plate",
+    "difficulty": "hard"
+  },
+  {
+    "category": "GUI",
+    "task": "craft_item:jungle_pressure_plate",
+    "difficulty": "easy"
+  },
+  {
+    "category": "GUI",
+    "task": "craft_item:brewing_stand",
+    "difficulty": "middle"
+  },
+  {
+    "category": "GUI",
+    "task": "craft_item:golden_shovel",
+    "difficulty": "hard"
+  },
+  {
+    "category": "GUI",
+    "task": "craft_item:yellow_concrete_powder",
+    "difficulty": "easy"
+  },
+  {
+    "category": "GUI",
+    "task": "craft_item:lime_terracotta",
+    "difficulty": "middle"
+  },
+  {
+    "category": "GUI",
+    "task": "craft_item:golden_sword",
+    "difficulty": "hard"
+  },
+  {
+    "category": "GUI",
+    "task": "craft_item:spruce_pressure_plate",
+    "difficulty": "easy"
+  },
+  {
+    "category": "GUI",
+    "task": "craft_item:polished_blackstone_brick_slab",
+    "difficulty": "middle"
+  },
+  {
+    "category": "GUI",
+    "task": "craft_item:redstone",
+    "difficulty": "hard"
+  },
+  {
+    "category": "GUI",
+    "task": "craft_item:dark_oak_boat",
+    "difficulty": "easy"
+  },
+  {
+    "category": "GUI",
+    "task": "craft_item:jungle_fence",
+    "difficulty": "middle"
+  },
+  {
+    "category": "GUI",
+    "task": "craft_item:cyan_glazed_terracotta",
+    "difficulty": "hard"
+  },
+  {
+    "category": "GUI",
+    "task": "craft_item:iron_block",
+    "difficulty": "easy"
+  },
+  {
+    "category": "GUI",
+    "task": "craft_item:wooden_shovel",
+    "difficulty": "middle"
+  },
+  {
+    "category": "GUI",
+    "task": "craft_item:warped_fence",
+    "difficulty": "hard"
+  }
+]

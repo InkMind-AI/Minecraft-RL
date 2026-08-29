@@ -39,6 +39,9 @@ case "${LAUNCH_SCRIPT}" in
     launch_textvla_qwen35_9b_checkpoint.sh)    SHORT_TAG="tv-q35" ;;
     launch_stage2_qwen2vl_7b.sh)               SHORT_TAG="s2-q2vl" ;;
     launch_stage2_qwen35_9b.sh)                SHORT_TAG="s2-q35" ;;
+    launch_qwen2vl_eosfix_checkpoint.sh)       SHORT_TAG="q2vl-eos" ;;
+    launch_qwen2vl_focal_checkpoint.sh)        SHORT_TAG="q2vl-fcl" ;;
+    launch_qwen35_focal_checkpoint.sh)         SHORT_TAG="q35-fcl" ;;
     *)
         # 未知脚本：用脚本名(去掉launch_/.sh、下划线转连字符)截断到8字符 + 4位hash保证唯一
         SHORT_TAG="${LAUNCH_SCRIPT#launch_}"
