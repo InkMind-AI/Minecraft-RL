@@ -10,6 +10,7 @@
 #   bash submit_eval_job.sh launch_qwen35.sh
 #   CKPT=820 bash submit_eval_job.sh launch_textvla_qwen2vl_7b_checkpoint.sh
 #   CKPT=820 bash submit_eval_job.sh launch_textvla_qwen35_9b_checkpoint.sh
+#   NOOP_TAG=2 CKPT=600 bash submit_eval_job.sh launch_qwen35_noop_checkpoint.sh
 #
 # 前提：本地代码改动要先同步到koala job读取代码的S3路径，比如：
 #   s5cmd sync examples/eval_backbones/ \
@@ -18,8 +19,10 @@
 # 可选环境变量：
 #   EVAL_BENCHMARK   评测规模，默认继承 run_backbone_eval.sh 的默认值(mini)。
 #                    需要跑完整benchmark时显式设 EVAL_BENCHMARK=full。
-#   CKPT             仅对 launch_textvla_*_checkpoint.sh 有意义，指定要评测的
-#                    训练 step（如 400/600/820）。
+#   CKPT             仅对 launch_textvla_*_checkpoint.sh / launch_qwen35_noop_checkpoint.sh
+#                    有意义，指定要评测的训练 step（如 400/600/820）。
+#   NOOP_TAG         仅对 launch_qwen35_noop_checkpoint.sh 有意义，指定 KEEP_NO_OP_P
+#                    对照组编号（2/5/7，对应 KEEP_NO_OP_P=0.2/0.5/0.7）。
 #   CODE_S3_URI      代码同步的S3路径，默认 s3://arcwm-code-us-west-2/axiom/code
 # ============================================================================
 set -euo pipefail
@@ -42,6 +45,7 @@ case "${LAUNCH_SCRIPT}" in
     launch_qwen2vl_eosfix_checkpoint.sh)       SHORT_TAG="q2vl-eos" ;;
     launch_qwen2vl_focal_checkpoint.sh)        SHORT_TAG="q2vl-fcl" ;;
     launch_qwen35_focal_checkpoint.sh)         SHORT_TAG="q35-fcl" ;;
+    launch_qwen35_noop_checkpoint.sh)          SHORT_TAG="q35-noop${NOOP_TAG:-}" ;;
     *)
         # 未知脚本：用脚本名(去掉launch_/.sh、下划线转连字符)截断到8字符 + 4位hash保证唯一
         SHORT_TAG="${LAUNCH_SCRIPT#launch_}"
@@ -57,6 +61,10 @@ CKPT_EXPORT=""
 if [ -n "${CKPT:-}" ]; then
     CKPT_SUFFIX="-c${CKPT}"
     CKPT_EXPORT="export CKPT=${CKPT}; "
+fi
+NOOP_TAG_EXPORT=""
+if [ -n "${NOOP_TAG:-}" ]; then
+    NOOP_TAG_EXPORT="export NOOP_TAG=${NOOP_TAG}; "
 fi
 BENCH_EXPORT=""
 if [ -n "${EVAL_BENCHMARK:-}" ]; then
@@ -75,10 +83,10 @@ fi
 JOB_NAME="axiomjin-eval-${SHORT_TAG}${CKPT_SUFFIX}"
 JOB_NAME="${JOB_NAME:0:29}"
 
-REMOTE_CMD="set -euo pipefail; export REPO_ROOT=/data/work/run_codes/Minecraft-CoT; ${CKPT_EXPORT}${BENCH_EXPORT}${ROLLOUT_EXPORT}${TASKLIST_EXPORT}cd /data/work/run_codes/Minecraft-CoT; apt-get update -qq 2>&1 | tail -3 || true; apt-get install -y -qq xvfb 2>&1 | tail -5 || true; bash examples/eval_backbones/${LAUNCH_SCRIPT}"
+REMOTE_CMD="set -euo pipefail; export REPO_ROOT=/data/work/run_codes/Minecraft-CoT; ${CKPT_EXPORT}${NOOP_TAG_EXPORT}${BENCH_EXPORT}${ROLLOUT_EXPORT}${TASKLIST_EXPORT}cd /data/work/run_codes/Minecraft-CoT; apt-get update -qq 2>&1 | tail -3 || true; apt-get install -y -qq xvfb 2>&1 | tail -5 || true; bash examples/eval_backbones/${LAUNCH_SCRIPT}"
 
 echo "[submit] job=${JOB_NAME}"
-echo "[submit] launch_script=${LAUNCH_SCRIPT} ckpt=${CKPT:-<none>} eval_benchmark=${EVAL_BENCHMARK:-<run_backbone_eval.sh默认值>} rollouts_per_task=${ROLLOUTS_PER_TASK:-<run_backbone_eval.sh默认值>}"
+echo "[submit] launch_script=${LAUNCH_SCRIPT} ckpt=${CKPT:-<none>} noop_tag=${NOOP_TAG:-<none>} eval_benchmark=${EVAL_BENCHMARK:-<run_backbone_eval.sh默认值>} rollouts_per_task=${ROLLOUTS_PER_TASK:-<run_backbone_eval.sh默认值>}"
 koala submit -m normal -j "${JOB_NAME}" -g 1 \
     -c "${REMOTE_CMD}" \
     --code "${CODE_S3_URI}:/data/work/run_codes" \
