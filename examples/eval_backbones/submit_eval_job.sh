@@ -62,6 +62,10 @@ BENCH_EXPORT=""
 if [ -n "${EVAL_BENCHMARK:-}" ]; then
     BENCH_EXPORT="export EVAL_BENCHMARK=${EVAL_BENCHMARK}; "
 fi
+ROLLOUT_EXPORT=""
+if [ -n "${ROLLOUTS_PER_TASK:-}" ]; then
+    ROLLOUT_EXPORT="export ROLLOUTS_PER_TASK=${ROLLOUTS_PER_TASK}; "
+fi
 TASKLIST_EXPORT=""
 if [ -n "${TASK_DIFFICULTY_LIST:-}" ]; then
     TASKLIST_EXPORT="export TASK_DIFFICULTY_LIST=$(printf '%q' "${TASK_DIFFICULTY_LIST}"); "
@@ -71,10 +75,10 @@ fi
 JOB_NAME="axiomjin-eval-${SHORT_TAG}${CKPT_SUFFIX}"
 JOB_NAME="${JOB_NAME:0:29}"
 
-REMOTE_CMD="set -euo pipefail; export REPO_ROOT=/data/work/run_codes/Minecraft-CoT; ${CKPT_EXPORT}${BENCH_EXPORT}${TASKLIST_EXPORT}cd /data/work/run_codes/Minecraft-CoT; apt-get update -qq 2>&1 | tail -3 || true; apt-get install -y -qq xvfb 2>&1 | tail -5 || true; bash examples/eval_backbones/${LAUNCH_SCRIPT}"
+REMOTE_CMD="set -euo pipefail; export REPO_ROOT=/data/work/run_codes/Minecraft-CoT; ${CKPT_EXPORT}${BENCH_EXPORT}${ROLLOUT_EXPORT}${TASKLIST_EXPORT}cd /data/work/run_codes/Minecraft-CoT; apt-get update -qq 2>&1 | tail -3 || true; apt-get install -y -qq xvfb 2>&1 | tail -5 || true; bash examples/eval_backbones/${LAUNCH_SCRIPT}"
 
 echo "[submit] job=${JOB_NAME}"
-echo "[submit] launch_script=${LAUNCH_SCRIPT} ckpt=${CKPT:-<none>} eval_benchmark=${EVAL_BENCHMARK:-<run_backbone_eval.sh默认值>}"
+echo "[submit] launch_script=${LAUNCH_SCRIPT} ckpt=${CKPT:-<none>} eval_benchmark=${EVAL_BENCHMARK:-<run_backbone_eval.sh默认值>} rollouts_per_task=${ROLLOUTS_PER_TASK:-<run_backbone_eval.sh默认值>}"
 koala submit -m normal -j "${JOB_NAME}" -g 1 \
     -c "${REMOTE_CMD}" \
     --code "${CODE_S3_URI}:/data/work/run_codes" \

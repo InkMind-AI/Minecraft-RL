@@ -8,19 +8,152 @@ Supports two on-disk layouts:
     session with image paths relative to an `image_root`.
 
 Also supports `text_only` mode (Stage I, no images) and `full_trajectory` mode
-(Stage III, multi-step loss on every assistant turn).
+(Stage III, multi-step loss on every assistant turn), plus `keep_no_op_p`
+(data-level no-op frame dropping, see `_is_no_op_action_text`).
 """
 
 from __future__ import annotations
 
 import io
 import logging
-from typing import Dict, List, Optional, Tuple, Union
+import random
+import re
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 from datasets import concatenate_datasets, load_dataset
 from PIL import Image
 
 logger = logging.getLogger(__name__)
+
+
+# ─── no-op action detection (data-level `keep_no_op_p` dropping) ───────────────
+
+# Text-action serialization produced by `openagents/agents/utils/action_mapping.py::
+# TextActionTokenizer._json_to_text`: "Action: " + " and ".join(parts), where parts are
+# `move(dx, dy)` / `press(k1, k2, ...)` / `click(left|right|middle)`, or the literal
+# "no_op" when every part is empty. `minecraft-text-action-dataset` was generated with
+# `reserved_camera=reserved_keyboard=True`, so a frame in which the human did nothing at
+# all still renders as the FULL "Action: move(0, 0) and press()" rather than
+# "Action: no_op" -- both spellings are therefore accepted below.
+#
+# Verified against the real dataset (train-00000-of-00363.parquet, row group 0, 2831
+# assistant steps): "Action: move(0, 0) and press()" is exactly 24.8% of all steps (the
+# single most common action by a factor of ~3), and 53.1% of steps are byte-identical to
+# the immediately preceding step.
+_ACTION_SPLIT_RE = re.compile(r"Action\s*:")
+_CAMERA_RE = re.compile(r"""move\(\s*['"]?(-?\d+(?:\.\d+)?)['"]?\s*,\s*['"]?(-?\d+(?:\.\d+)?)['"]?\s*\)""")
+_KEYBOARD_RE = re.compile(r"press\(([^)]*)\)")
+_CLICK_RE = re.compile(r"click\(")
+
+
+def _is_no_op_action_text(text: str) -> bool:
+    """Whether one assistant turn's text is a pure no-op (camera still, no keys, no clicks).
+
+    Parses the action instead of substring-matching one exact spelling, so it stays
+    correct across `TextActionTokenizer`'s variants (`Action: no_op` vs the reserved-field
+    `Action: move(0, 0) and press()`), whitespace/quoting differences, float-vs-int
+    coordinates, and `action_chunk_len > 1` (several "Action: ..." segments in one turn --
+    ALL of them must be no-op for the turn to count as one).
+
+    Deliberately FAIL-SAFE: anything unrecognized (empty text, an action naming neither
+    `move` nor `press` nor `no_op`) returns False, i.e. "not a no-op, never drop it".
+    Getting this wrong in the other direction would silently delete real decision points
+    from training -- the exact failure mode that a content-type mismatch once caused in
+    `collators.py::_assistant_turn_text` (86% of steps dropped, including 82% of genuine
+    decision points).
+    """
+    text = (text or "").strip()
+    if not text:
+        return False
+    segments = [seg.strip() for seg in _ACTION_SPLIT_RE.split(text) if seg.strip()]
+    if not segments:
+        return False
+    for seg in segments:
+        if seg == "no_op":
+            continue
+        if _CLICK_RE.search(seg):
+            return False
+        camera = _CAMERA_RE.search(seg)
+        if camera and (float(camera.group(1)) != 0.0 or float(camera.group(2)) != 0.0):
+            return False
+        keyboard = _KEYBOARD_RE.search(seg)
+        if keyboard and keyboard.group(1).strip():
+            return False
+        if camera is None and keyboard is None:
+            return False  # unrecognized action text -> fail safe
+    return True
+
+
+def _turn_text(message: Dict) -> str:
+    """Flatten one chat message's text content items into plain text.
+
+    Duck-typed over the content sequence (not `isinstance(..., list)`) because a raw
+    parquet/Arrow round-trip can hand back a `numpy.ndarray` or tuple instead of a real
+    list; requiring `list` there is what once made every assistant turn compare equal in
+    `collators.py`.
+    """
+    content = message.get("content")
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content.strip()
+    try:
+        items = list(content)
+    except TypeError:
+        return ""
+    parts = [item.get("text") or "" for item in items if isinstance(item, dict) and item.get("type") == "text"]
+    return " ".join(parts).strip()
+
+
+def _no_op_dropped_turns(
+    conversations: List[Dict],
+    keep_no_op_p: float,
+    rng: random.Random,
+) -> Set[int]:
+    """Turn indices to delete outright, implementing OpenHA's `keep_no_op_p` at the DATA
+    level (`action_mapping.py::TextActionTokenizer.encode` drops the frame's `frame_id`,
+    so both the observation and the action vanish from the encoded trajectory).
+
+    Each no-op assistant turn is kept with probability `keep_no_op_p` and otherwise
+    dropped TOGETHER WITH the user turn immediately before it -- that user turn holds the
+    frame's observation image, and keeping an observation whose action was deleted would
+    both break the strict user/assistant alternation and silently re-pair every image with
+    the *next* frame's action.
+
+    A user turn that carries text content is never dropped (and so neither is its
+    assistant turn): in `minecraft-text-action-dataset` that is exactly the first turn,
+    which holds the system prompt + task instruction. This also guarantees at least one
+    assistant turn always survives, so the trajectory can never be emptied.
+
+    Returns an empty set when `keep_no_op_p >= 1.0` (mechanism disabled), making that path
+    byte-identical to the previous behaviour.
+    """
+    if keep_no_op_p >= 1.0:
+        return set()
+
+    dropped: Set[int] = set()
+    for idx, conv in enumerate(conversations):
+        if conv.get("role") != "assistant":
+            continue
+        if not _is_no_op_action_text(_turn_text(conv)):
+            continue
+        # Mirrors OpenHA's `random.random() > keep_no_op_p` predicate exactly, so
+        # keep_no_op_p=0.0 drops every (droppable) no-op and 1.0 drops none.
+        if not rng.random() > keep_no_op_p:
+            continue
+        prev = idx - 1
+        if prev < 0 or conversations[prev].get("role") != "user":
+            continue
+        prev_content = conversations[prev].get("content")
+        try:
+            prev_items = list(prev_content) if prev_content is not None else []
+        except TypeError:
+            continue
+        if any(isinstance(item, dict) and item.get("type") == "text" for item in prev_items):
+            continue  # instruction-bearing turn: keep it (and its action)
+        dropped.add(prev)
+        dropped.add(idx)
+    return dropped
 
 
 # ─── dataset helpers ──────────────────────────────────────────────────────────
@@ -101,16 +234,29 @@ def _split_prompt_completion_with_images(
     return prompt, completion, images
 
 
+_logged_no_op_example = False
+
+
 def _build_full_trajectory(
     conversations: List[Dict],
     image_bytes_list: List[bytes],
+    keep_no_op_p: float = 1.0,
+    rng: Optional[random.Random] = None,
 ) -> Tuple[Optional[List[Dict]], Optional[List[Image.Image]]]:
     """One parquet trajectory row -> full (messages, images) for multi-step loss.
 
     Mirrors `_split_prompt_completion_with_images` (same content normalization + image
     decode) but keeps the WHOLE conversation: no prompt/completion split, so every
     assistant "Action: ..." turn stays a training target for `_MultiStepVLMCollator`.
+
+    `keep_no_op_p < 1.0` additionally deletes no-op (observation, action) turn pairs
+    outright -- OpenHA's `keep_no_op_p` applied at the data level; see
+    `_no_op_dropped_turns`. Dropped images are never decoded (only their index is
+    consumed), so this also makes the trajectory cheaper to preprocess AND shorter in
+    vision tokens.
     """
+    global _logged_no_op_example
+
     if not conversations or len(conversations) < 2:
         return None, None
     if conversations[0]["role"] != "user":
@@ -118,14 +264,21 @@ def _build_full_trajectory(
     if not conversations or conversations[-1]["role"] != "assistant":
         return None, None
 
+    dropped = _no_op_dropped_turns(conversations, keep_no_op_p, rng or random)
+
     messages, images, image_idx = [], [], 0
-    for conv in conversations:
+    for turn_idx, conv in enumerate(conversations):
+        keep_turn = turn_idx not in dropped
         content_list = []
         for item in conv["content"]:
             if item.get("type") == "text":
-                content_list.append({"type": "text", "text": item.get("text", "")})
+                if keep_turn:
+                    content_list.append({"type": "text", "text": item.get("text", "")})
             elif item.get("type") == "image":
-                if image_idx < len(image_bytes_list):
+                # `image_idx` walks `image_bytes_list` in encounter order and must advance
+                # for dropped turns too, or every later turn would be paired with the
+                # wrong frame's image.
+                if keep_turn and image_idx < len(image_bytes_list):
                     try:
                         images.append(Image.open(io.BytesIO(image_bytes_list[image_idx])).convert("RGB"))
                         content_list.append({"type": "image"})
@@ -133,7 +286,27 @@ def _build_full_trajectory(
                         logger.warning(f"Failed to decode image at idx {image_idx}: {e}")
                         content_list.append({"type": "text", "text": "[image]"})
                 image_idx += 1
-        messages.append({"role": conv["role"], "content": content_list})
+        if keep_turn:
+            messages.append({"role": conv["role"], "content": content_list})
+
+    # Unreachable in practice (the instruction-bearing first turn and its action are never
+    # droppable, see `_no_op_dropped_turns`), but an empty/assistant-less trajectory would
+    # produce an all -100 label row and a NaN loss, so fail loudly-but-safely instead.
+    if len(messages) < 2 or messages[-1]["role"] != "assistant":
+        logger.warning(
+            "keep_no_op_p dropping left a trajectory with no usable assistant turn "
+            f"({len(conversations)} turns in, {len(messages)} out); dropping the sample."
+        )
+        return None, None
+
+    if dropped and not _logged_no_op_example:
+        _logged_no_op_example = True
+        logger.info(
+            f"keep_no_op_p={keep_no_op_p}: first affected trajectory went from "
+            f"{len(conversations)} to {len(messages)} turns "
+            f"({len(dropped) // 2} no-op (observation, action) pairs dropped, "
+            f"{len(images)} images kept)."
+        )
     return messages, images
 
 
@@ -285,6 +458,8 @@ def _row_to_trl_sample(
     processor=None,
     max_seq_length: Optional[int] = None,
     full_trajectory: bool = False,
+    keep_no_op_p: float = 1.0,
+    no_op_seed: int = 0,
 ) -> Dict:
     """
     Map ONE raw dataset row (parquet trajectory step OR jsonl QA session, per
@@ -309,6 +484,11 @@ def _row_to_trl_sample(
     length-checked (`_exceeds_max_length`) -- otherwise `SFTConfig`'s raw-token-level
     truncation can land inside an image's placeholder-token block, and the VLM forward
     pass crashes with a tokens/features mismatch (observed for real on Qwen2-VL-7B).
+
+    `keep_no_op_p` (`full_trajectory` only) drops no-op frames at the data level; its RNG
+    is seeded per row from `(no_op_seed, idx)` so the decision is reproducible for a given
+    seed and independent of the global `random` stream (which `datasets`' multiprocess
+    `.map` workers would otherwise make nondeterministic).
     """
     chat_template_kwargs = _resolve_chat_template_kwargs(processor)
     if text_only:
@@ -328,7 +508,12 @@ def _row_to_trl_sample(
         # every assistant turn. Oversized trajectories are dropped (same rationale as
         # the prompt/completion path below: truncation through a vision-token block
         # crashes the forward pass).
-        messages, images = _build_full_trajectory(sample["conversations"], sample.get("image_bytes", []))
+        messages, images = _build_full_trajectory(
+            sample["conversations"],
+            sample.get("image_bytes", []),
+            keep_no_op_p=keep_no_op_p,
+            rng=random.Random(f"{no_op_seed}:{idx}"),
+        )
         if messages is None:
             return {"messages": [], "images": [], "chat_template_kwargs": {}, "_keep": False}
         if images and processor is not None and max_seq_length is not None:
@@ -518,6 +703,8 @@ def build_minecraft_dataset(
     processor=None,
     max_seq_length: Optional[int] = None,
     full_trajectory: bool = False,
+    keep_no_op_p: float = 1.0,
+    no_op_seed: int = 0,
 ):
     """
     Build the Minecraft SFT dataset as a genuine `datasets.Dataset` (`streaming=False`)
@@ -565,6 +752,17 @@ def build_minecraft_dataset(
     truncated (see `_exceeds_max_length` for why blind truncation crashes VLM training).
     Pass the same `AutoProcessor` used for the model. Omit both to skip this check
     (e.g. for `--text_only` data, which has no images and thus no risk of this crash).
+
+    `keep_no_op_p` (default 1.0 = disabled, requires `full_trajectory=True`): probability
+    of KEEPING each pure-no-op frame. This is OpenHA's `keep_no_op_p` knob applied at the
+    DATA level -- a dropped frame's observation image and action both disappear from the
+    trajectory, so they contribute neither loss nor context (contrast
+    `MultiStepVLMCollator(focal_decay=...)`, which keeps the original distribution and only
+    rebalances its gradient contribution). The two mechanisms are independent and compose:
+    OpenHA itself ships both, using data-level dropping for its `MotionTokenizer` route
+    (`keep_no_op_p=0` by default) and loss-level focal masking for the text-action route
+    (`keep_no_op_p=1.0` by default). Measured on `minecraft-text-action-dataset`, 24.8% of
+    assistant steps are pure no-ops, so e.g. `keep_no_op_p=0.2` removes ~20% of all steps.
     """
     if data_format == "auto":
         data_format = _detect_data_format(data_path)
@@ -584,6 +782,19 @@ def build_minecraft_dataset(
             "checkpoints to collapse to always predicting move(0,0) (long runs of "
             "identical actions dominated the loss when each sample only targets one "
             "action). Pass --full_trajectory to train on every assistant turn instead."
+        )
+    if not 0.0 <= keep_no_op_p <= 1.0:
+        raise ValueError(f"keep_no_op_p must be in [0.0, 1.0], got {keep_no_op_p}")
+    if keep_no_op_p < 1.0 and not full_trajectory:
+        # Only `_build_full_trajectory` can drop a frame: the prompt/completion paths
+        # produce ONE target action per sample, so "dropping the no-op frame" there means
+        # dropping the whole sample, which is a different (and untested) operation.
+        # Raise rather than silently ignore the flag -- a run that looks like it filtered
+        # no-ops but didn't is the worst possible outcome for an A/B comparison.
+        raise ValueError(
+            f"keep_no_op_p={keep_no_op_p} requires full_trajectory=True (it drops no-op "
+            "(observation, action) turn pairs inside a trajectory); it has no meaning for "
+            "the single-target prompt/completion data paths."
         )
     if data_format == "jsonl" and image_root is None:
         image_root = _default_image_root(data_path)
@@ -613,6 +824,8 @@ def build_minecraft_dataset(
             "processor": processor,
             "max_seq_length": max_seq_length,
             "full_trajectory": full_trajectory,
+            "keep_no_op_p": keep_no_op_p,
+            "no_op_seed": no_op_seed,
         },
         remove_columns=raw_columns,
     )

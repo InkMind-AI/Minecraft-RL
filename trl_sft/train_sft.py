@@ -153,6 +153,8 @@ def _build_dataset(args, processor):
         processor=processor,
         max_seq_length=args.max_seq_length,
         full_trajectory=args.full_trajectory,
+        keep_no_op_p=args.keep_no_op_p,
+        no_op_seed=args.seed,
     )
 
 
@@ -359,6 +361,19 @@ def main():
         "minecraft-text-action-dataset, which otherwise collapses checkpoints into "
         "always emitting 'move(0, 0) and press()'. Use 1.0 to disable.",
     )
+    parser.add_argument(
+        "--keep_no_op_p",
+        type=float,
+        default=1.0,
+        help="DATA-level no-op dropping for --full_trajectory (OpenHA's `keep_no_op_p`, "
+        "used by default on its MotionTokenizer route and by VPT's own data loader, which "
+        "skips null-action frames entirely). Probability of KEEPING each pure-no-op frame "
+        "('Action: move(0, 0) and press()' / 'Action: no_op'); a dropped frame loses BOTH "
+        "its observation image and its action, so unlike --focal_decay (which only "
+        "rebalances gradient weight) it actually changes the training distribution and "
+        "shortens trajectories. 24.8%% of assistant steps in minecraft-text-action-dataset "
+        "are pure no-ops. Default 1.0 disables it; the two mechanisms compose freely.",
+    )
     parser.add_argument("--max_seq_length", type=int, default=16384)
     parser.add_argument("--per_device_batch_size", type=int, default=2)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
@@ -466,6 +481,20 @@ def main():
             "--packing was requested, but TRL's SFTTrainer does not support sequence "
             "packing for vision-language models (Qwen2-VL / Qwen2.5-VL / Qwen3-VL / "
             "Qwen3.5-VL are all VLMs here). Remove --packing."
+        )
+
+    # Fail before the (slow) model download/load rather than inside `_build_dataset`.
+    if not 0.0 <= args.keep_no_op_p <= 1.0:
+        raise ValueError(f"--keep_no_op_p must be in [0.0, 1.0], got {args.keep_no_op_p}")
+    if args.keep_no_op_p < 1.0 and not args.full_trajectory:
+        raise ValueError(
+            f"--keep_no_op_p {args.keep_no_op_p} requires --full_trajectory (it drops "
+            "no-op (observation, action) turn pairs inside a trajectory)."
+        )
+    if args.full_trajectory:
+        logger.info(
+            f"Stage III repeat/no-op handling: focal_decay={args.focal_decay} (loss-level), "
+            f"keep_no_op_p={args.keep_no_op_p} (data-level)"
         )
 
     # ── seed ──

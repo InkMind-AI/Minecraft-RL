@@ -49,8 +49,8 @@ MODEL_LOCAL="$WORK/stage2_model"
 DATA_RAW="$WORK/parquet"
 DATA_JSONL="$WORK/jsonl"          # MUST contain only .jsonl (VeOmni os.listdir()s it)
 DATA_IMAGES="$WORK/jsonl_images"  # images live outside DATA_JSONL, see above
-OUTPUT_DIR="$WORK/output"
-S3_OUTPUT="s3://arcwm-code-us-west-2/axiom/model/veomni-baseline-qwen2vl-stage3"
+OUTPUT_DIR="${OUTPUT_DIR:-$WORK/output}"
+S3_OUTPUT="${S3_OUTPUT:-s3://arcwm-code-us-west-2/axiom/model/veomni-baseline-qwen2vl-stage3}"
 
 echo "=== [1/6] Setting up VeOmni conda env ==="
 CONDA_BASE=$(conda info --base)
@@ -125,7 +125,85 @@ if config.get("model_type") == "qwen2_vl" and isinstance(config.get("text_config
 else:
     print(f"VeOmni-compatible Qwen2-VL config already present: {config_path}")
 PY
-ls -la "$MODEL_LOCAL" | head -6
+
+# Transformers 5.15 writes `extra_special_tokens` as a list, while Transformers
+# 4.51 assumes this field is a dict and calls `.keys()` while constructing the
+# tokenizer. The token inventory itself remains in tokenizer.json, so removing this
+# incompatible redundant metadata preserves tokenization and unblocks AutoProcessor.
+python - "$MODEL_LOCAL/tokenizer_config.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+config_path = Path(sys.argv[1])
+if not config_path.exists():
+    raise FileNotFoundError(f"Missing tokenizer config: {config_path}")
+config = json.loads(config_path.read_text())
+if isinstance(config.get("extra_special_tokens"), list):
+    config.pop("extra_special_tokens")
+    config_path.write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n")
+    print(f"Removed Transformers-5-only extra_special_tokens metadata: {config_path}")
+else:
+    print(f"Tokenizer config already compatible with Transformers 4.51: {config_path}")
+PY
+
+# Transformers 4.51's Qwen2VLProcessor looks for the legacy flat
+# `preprocessor_config.json`, while the Stage II export from Transformers 5.15 only
+# carries a merged `processor_config.json`. Without this conversion every rank loads
+# model weights successfully, then dies in AutoProcessor.from_pretrained() before the
+# dataloader is built. Keep processor_config.json intact as the conversion source; the
+# old processor only needs the flat companion file.
+python - "$MODEL_LOCAL/processor_config.json" "$MODEL_LOCAL/preprocessor_config.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+processor_path = Path(sys.argv[1])
+preprocessor_path = Path(sys.argv[2])
+if preprocessor_path.exists():
+    print(f"Legacy preprocessor config already present: {preprocessor_path}")
+elif not processor_path.exists():
+    raise FileNotFoundError(
+        f"Missing both {preprocessor_path.name} and {processor_path.name}; "
+        "cannot construct a Transformers-4.51 Qwen2-VL processor config."
+    )
+else:
+    source = json.loads(processor_path.read_text())
+    image_processor = source.get("image_processor")
+    if not isinstance(image_processor, dict):
+        raise ValueError(f"{processor_path} has no image_processor object")
+    size = image_processor.get("size") or {}
+    required = ("shortest_edge", "longest_edge")
+    if not all(key in size for key in required):
+        raise ValueError(f"{processor_path} has invalid image_processor.size: {size!r}")
+    output = {
+        "min_pixels": size["shortest_edge"],
+        "max_pixels": size["longest_edge"],
+        "patch_size": image_processor["patch_size"],
+        "temporal_patch_size": image_processor["temporal_patch_size"],
+        "merge_size": image_processor["merge_size"],
+        "image_mean": image_processor["image_mean"],
+        "image_std": image_processor["image_std"],
+        "image_processor_type": image_processor["image_processor_type"],
+        "processor_class": source["processor_class"],
+    }
+    preprocessor_path.write_text(json.dumps(output, indent=2) + "\n")
+    print(f"Derived legacy preprocessor config for VeOmni: {preprocessor_path}")
+PY
+
+# ProcessorMixin in Transformers 4.51 first builds the image processor from the
+# legacy file, then also reads the newer merged processor_config.json and passes a
+# second image_processor argument into Qwen2VLProcessor, producing
+# "multiple values for argument image_processor". Once the flat config exists, move
+# the merged source aside so the old loader follows its normal two-component
+# (image_processor + tokenizer) path. Keep it under a diagnostic filename rather than
+# deleting it.
+PROCESSOR_CONFIG="$MODEL_LOCAL/processor_config.json"
+if [ -f "$PROCESSOR_CONFIG" ]; then
+    mv -f "$PROCESSOR_CONFIG" "${PROCESSOR_CONFIG}.transformers5"
+    echo "Moved incompatible merged processor config aside for Transformers 4.51"
+fi
+ls -la "$MODEL_LOCAL" | head -9
 
 echo "=== [3/6] Downloading text-action parquet (all 363 shards) ==="
 mkdir -p "$DATA_RAW"
@@ -155,12 +233,16 @@ du -sh "$DATA_JSONL" "$DATA_IMAGES"
 echo "=== [5/6] Launching VeOmni training ==="
 cd /data/work/run_codes/OpenHA/CrossAgent/SFT/VeOmni
 
-# Mirror the official script's batch/step arithmetic exactly.
-NPROC=8
-NNODES=1
-ULYSSES=4
-MICRO_BSZ=4
-GRAD_ACCUM=1
+# VeOmni exposes gradient accumulation through `global_batch_size`: its dataloader
+# splits each optimizer update into `global_batch_size / (micro_batch_size * dp_size)`
+# micro-batches. Defaults mirror the original OpenHA recipe (global batch 8). Override
+# GRAD_ACCUM=8 to match our TRL Stage III effective global batch 64 without changing
+# per-rank sequence memory or Ulysses sequence parallelism.
+NPROC="${NPROC:-8}"
+NNODES="${NNODES:-1}"
+ULYSSES="${ULYSSES:-4}"
+MICRO_BSZ="${MICRO_BSZ:-4}"
+GRAD_ACCUM="${GRAD_ACCUM:-1}"
 REAL_DATASET_LEN=$(cat "$DATA_JSONL"/*.jsonl | wc -l)
 TOTAL_WORKERS=$(( NPROC * NNODES / ULYSSES ))
 GLOBAL_BSZ=$(( TOTAL_WORKERS * MICRO_BSZ * GRAD_ACCUM ))
@@ -175,9 +257,9 @@ LR_WARMUP_RATIO=$(python -c "print(f'{$WARMUP_STEPS / $MAX_STEPS:.6f}')")
 echo "dataset_len=$REAL_DATASET_LEN global_bsz=$GLOBAL_BSZ max_steps=$MAX_STEPS warmup_steps=$WARMUP_STEPS ratio=$LR_WARMUP_RATIO"
 
 export WANDB_API_KEY=9775ea57c312e2b1445afe756e7e68b72a1307b7
-export WANDB_PROJECT=minecraft-sft
+export WANDB_PROJECT="${WANDB_PROJECT:-minecraft-sft}"
 export SWANLAB_MODE=disabled
-WANDB_NAME="veomni-baseline-qwen2vl-stage3"
+WANDB_NAME="${WANDB_NAME:-veomni-baseline-qwen2vl-stage3}"
 
 # VeOmni has no equivalent of our trl_sft S3CheckpointUploadCallback, so checkpoints
 # would only exist on the node's ephemeral /local-ssd until the very end -- a crash or

@@ -6,6 +6,11 @@
 # FOCAL_DECAY (env var, default 0.75): VeOmni's repeated-action loss suppression --
 # see collators.py::MultiStepVLMCollator. Set FOCAL_DECAY=1.0 to disable.
 #
+# KEEP_NO_OP_P (env var, default 1.0 = off): OpenHA/VPT-style DATA-level no-op dropping --
+# probability of keeping each pure-no-op frame; a dropped frame loses both its observation
+# image and its action. See dataset.py::_no_op_dropped_turns. Independent of and composable
+# with FOCAL_DECAY (e.g. KEEP_NO_OP_P=0.2 FOCAL_DECAY=0.75).
+#
 # --linear-attn-kernels: opt-in, installs causal-conv1d + flash-linear-attention so
 # Qwen3.5's linear_attention layers use their fused kernel instead of transformers'
 # pure-PyTorch fallback (benchmarked ~24.5x faster on the core op alone -- see
@@ -27,6 +32,12 @@ DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-2}"
 # docstring): 0.75 matches VeOmni's own published TextVLA training recipe. Set to 1.0 to
 # disable (restores the plain "every assistant token gets equal loss weight" behaviour).
 FOCAL_DECAY="${FOCAL_DECAY:-0.75}"
+# Data-level no-op dropping (dataset.py::_no_op_dropped_turns). Defaults to 1.0 (OFF) so
+# this stays byte-identical to previous runs unless explicitly opted into: OpenHA's own
+# text-action route also leaves its `keep_no_op_p` at 1.0 and relies on focal masking
+# alone. Set e.g. KEEP_NO_OP_P=0.2 to additionally remove ~80% of the 24.8% pure-no-op
+# steps, matching VPT's "skip null actions" data pipeline more closely.
+KEEP_NO_OP_P="${KEEP_NO_OP_P:-1.0}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
@@ -92,6 +103,7 @@ torchrun --nproc_per_node="$NPROC" --tee 3 train_sft.py \
     --resume_from_checkpoint auto \
     --full_trajectory \
     --focal_decay "$FOCAL_DECAY" \
+    --keep_no_op_p "$KEEP_NO_OP_P" \
     --attn_implementation "$ATTN_IMPL" \
     --max_seq_length "$MAX_SEQ_LENGTH" \
     --per_device_batch_size "$PER_DEVICE_BATCH_SIZE" \

@@ -181,10 +181,16 @@ class MultiStepVLMCollator(DataCollatorForVisionLanguageModeling):
     Stage III runs without this mechanism collapsed exactly as predicted -- evaluating
     checkpoint-1400 gave 200/200 identical `move(0, 0) and press()` steps on
     kill_entity/mine_block rollouts (0% success), while the much earlier checkpoint-200
-    still produced varied actions. Note the fix is deliberately at the LOSS level, not a
-    dataset rewrite: OpenHA's published data pipeline does no no-op filtering either
-    (`keep_no_op_p` defaults to 1.0 and is never overridden for text actions), so the
+    still produced varied actions. Note this mechanism acts at the LOSS level only:
+    OpenHA's published text-action pipeline does no no-op filtering either (its
+    `keep_no_op_p` defaults to 1.0 and is never overridden for text actions), so the
     original distribution is kept and only its gradient contribution is rebalanced.
+
+    The complementary DATA-level knob (OpenHA's `keep_no_op_p`, which its MotionTokenizer
+    route enables by default and which VPT's own data loader applies as a hard skip) lives
+    in `dataset.py::_no_op_dropped_turns` behind `--keep_no_op_p` (default 1.0 = off).
+    The two are independent and compose: focal only ever masks loss, so a frame dropped
+    upstream is simply never seen here.
 
     `focal_decay=1.0` disables the mechanism entirely (alpha stays 1.0, so
     `random() > alpha` is never true) and restores the previous behaviour.
