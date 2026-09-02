@@ -44,6 +44,11 @@ LOCAL_DATA_ROOT="${LOCAL_DATA_ROOT:-/local-ssd/minecraft-vlp}"
 LOCAL_PARQUET_ROOT="${LOCAL_PARQUET_ROOT:-/local-ssd/minecraft-text-action}"
 DOWNLOAD_CACHE="${DOWNLOAD_CACHE:-/local-ssd/model_cache}"
 DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-2}"
+# Non-streaming datasets materialize their Arrow cache here (train_sft.py
+# --datasets_cache_dir picks this env up). Stage3's parquet dataset is ~170GB of
+# embedded images, so this MUST live on the big node-local SSD, not datasets'
+# default ~/.cache/huggingface (usually a much smaller container disk).
+export DATASETS_CACHE_DIR="${DATASETS_CACHE_DIR:-/local-ssd/hf_datasets_cache}"
 
 # W&B: key hardcoded here so both local and remote koala jobs pick it up
 # automatically -- no need to export WANDB_API_KEY in the submit -c command.

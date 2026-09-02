@@ -55,6 +55,7 @@ NOTE on VLM + TRL:
 import argparse
 import json
 import logging
+import math
 import os
 import shutil
 import subprocess
@@ -63,7 +64,9 @@ from pathlib import Path
 from typing import Dict, Optional
 
 import torch
+from torch.utils.data import SequentialSampler
 from transformers import AutoModelForImageTextToText, AutoProcessor, TrainerCallback, set_seed
+from transformers.trainer_utils import has_length
 from trl import SFTConfig, SFTTrainer
 
 from collators import (
@@ -143,10 +146,10 @@ def _load_model_and_processor(args):
 
 
 def _build_dataset(args, processor):
-    """Build the Minecraft SFT dataset (streaming, unsharded)."""
+    """Build the Minecraft SFT dataset (non-streaming by default; --streaming for legacy)."""
     return build_minecraft_dataset(
         data_path=args.data_path,
-        streaming=True,
+        streaming=args.streaming,
         data_format=args.data_format,
         image_root=args.image_root,
         text_only=args.text_only,
@@ -155,7 +158,30 @@ def _build_dataset(args, processor):
         full_trajectory=args.full_trajectory,
         keep_no_op_p=args.keep_no_op_p,
         no_op_seed=args.seed,
+        num_proc=args.map_num_proc,
+        cache_dir=args.datasets_cache_dir,
     )
+
+
+class SequentialSFTTrainer(SFTTrainer):
+    """SFTTrainer that iterates the dataset in its materialized (file) order.
+
+    HF Trainer's default sampler for map-style datasets is `RandomSampler` -- i.e. it
+    SHUFFLES by default, and there is no TrainingArguments switch to turn that off. To
+    keep sample order identical to the legacy streaming pipeline (sorted shard files,
+    in-file row order -- the order every pre-non-streaming run trained in, and what
+    makes cross-run A/B comparisons and data-position debugging possible), this
+    subclass pins a `SequentialSampler`. Pass `--shuffle` to opt back into the default
+    seeded RandomSampler.
+
+    Only meaningful for non-streaming datasets: IterableDataset goes through a
+    different code path (`_get_train_sampler` returns None / is unused).
+    """
+
+    def _get_train_sampler(self):
+        if self.train_dataset is None or not has_length(self.train_dataset):
+            return None
+        return SequentialSampler(self.train_dataset)
 
 
 def _setup_collator(trainer, args, processor):
@@ -374,6 +400,39 @@ def main():
         "shortens trajectories. 24.8%% of assistant steps in minecraft-text-action-dataset "
         "are pure no-ops. Default 1.0 disables it; the two mechanisms compose freely.",
     )
+    parser.add_argument(
+        "--streaming",
+        action="store_true",
+        help="LEGACY mode: build the dataset as a streaming IterableDataset. Non-streaming "
+        "(the default) materializes an Arrow cache instead, which gives a known dataset "
+        "length (exact-epoch max_steps, correct progress bar), index-level resume skips "
+        "(no multi-minute data-replay after --resume_from_checkpoint), and parallel "
+        "preprocessing (--map_num_proc). Only pass this to reproduce pre-non-streaming "
+        "runs exactly.",
+    )
+    parser.add_argument(
+        "--shuffle",
+        action="store_true",
+        help="Shuffle training samples each epoch (seeded by --seed, reproducible). "
+        "Default OFF: SequentialSFTTrainer iterates in original file order, matching "
+        "the legacy streaming pipeline's order. Only meaningful without --streaming.",
+    )
+    parser.add_argument(
+        "--datasets_cache_dir",
+        type=str,
+        default=os.environ.get("DATASETS_CACHE_DIR"),
+        help="Where the non-streaming Arrow cache is materialized (default: env "
+        "DATASETS_CACHE_DIR, set by common.sh to /local-ssd/hf_datasets_cache on koala "
+        "nodes). MUST be a big local disk for the ~170GB stage3 parquet dataset.",
+    )
+    parser.add_argument(
+        "--map_num_proc",
+        type=int,
+        default=int(os.environ.get("MAP_NUM_PROC", "8")),
+        help="Worker processes for the one-time non-streaming .map() cache build "
+        "(default: env MAP_NUM_PROC or 8). Falls back to single-process automatically "
+        "if pickling the map fn/processor across workers fails.",
+    )
     parser.add_argument("--max_seq_length", type=int, default=16384)
     parser.add_argument("--per_device_batch_size", type=int, default=2)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
@@ -512,12 +571,23 @@ def main():
     n_gpus = int(os.environ.get("WORLD_SIZE", os.environ.get("LOCAL_WORLD_SIZE", 1)))
     if args.max_steps is not None:
         max_steps = args.max_steps
+    elif not args.streaming and dataset is not None and has_length(dataset):
+        # Non-streaming knows the TRUE sample count (post map/filter) -- compute the
+        # exact one-epoch step count so the LR schedule and progress bar end precisely
+        # at data exhaustion instead of a guessed ceiling.
+        steps_per_epoch = math.ceil(len(dataset) / (total_batch_size * n_gpus))
+        max_steps = steps_per_epoch * args.num_train_epochs
+        logger.info(
+            f"max_steps auto-computed from materialized dataset: {len(dataset)} samples / "
+            f"{total_batch_size * n_gpus} per step = {steps_per_epoch} steps/epoch "
+            f"x {args.num_train_epochs} epoch(s) = {max_steps}"
+        )
     else:
-        # Compute max_steps from approximate dataset size. This magic number is
-        # `minecraft-text-action-dataset`-specific (363 files x ~600 samples each ~=
-        # 217800 samples per epoch) -- it does NOT apply to other datasets/formats
-        # (e.g. --text_only Stage I data, which has a very different row count). Pass
-        # --max_steps explicitly for anything other than the default parquet dataset.
+        # Streaming fallback: compute max_steps from approximate dataset size. This
+        # magic number is `minecraft-text-action-dataset`-specific (363 files x ~600
+        # samples each ~= 217800 samples per epoch) -- it does NOT apply to other
+        # datasets/formats (e.g. --text_only Stage I data, which has a very different
+        # row count). Pass --max_steps explicitly for anything else.
         if args.text_only or args.data_format == "jsonl":
             logger.warning(
                 "No --max_steps given and --text_only/--data_format=jsonl is set: "
@@ -594,7 +664,15 @@ def main():
     )
 
     # ── trainer ──
-    trainer = SFTTrainer(
+    # Default sample order = original file order (SequentialSFTTrainer); HF's default
+    # RandomSampler is opt-in via --shuffle. Streaming datasets have no sampler at all.
+    trainer_cls = SFTTrainer
+    if not args.streaming and not args.shuffle:
+        trainer_cls = SequentialSFTTrainer
+        logger.info("Sample order: SequentialSampler (original file order; pass --shuffle to enable seeded shuffling)")
+    elif args.shuffle and args.streaming:
+        logger.warning("--shuffle has no effect together with --streaming (IterableDataset has no sampler).")
+    trainer = trainer_cls(
         model=model,
         args=training_args,
         train_dataset=dataset,

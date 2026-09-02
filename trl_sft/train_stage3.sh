@@ -3,6 +3,15 @@
 # Usage:
 #   MODEL_PATH=<stage2 checkpoint> bash train_stage3.sh [--nproc N] [--attn-impl sdpa|flash_attention_2] [--linear-attn-kernels]
 #
+# Data loading is NON-STREAMING by default (train_sft.py default since 2026-09-02):
+# the parquet shards are materialized into an Arrow cache on /local-ssd
+# (DATASETS_CACHE_DIR, see common.sh) with parallel preprocessing (MAP_NUM_PROC,
+# default 8), giving a known dataset length (exact-epoch max_steps), index-level
+# resume skips (no multi-minute data replay after a crash-resume) and original
+# file-order iteration (SequentialSampler; pass SHUFFLE=1 to train_sft.py's --shuffle
+# for seeded shuffling). Pass STREAMING=1-style --streaming to train_sft.py directly
+# to reproduce the legacy IterableDataset behavior.
+#
 # FOCAL_DECAY (env var, default 0.75): VeOmni's repeated-action loss suppression --
 # see collators.py::MultiStepVLMCollator. Set FOCAL_DECAY=1.0 to disable.
 #
@@ -23,7 +32,11 @@ set -euo pipefail
 MODEL_PATH="${MODEL_PATH:-}"
 DATA_PATH="${DATA_PATH:-s3://arcwm-code-us-west-2/axiom/data/minecraft-text-action-dataset/data/train-*.parquet}"
 OUTPUT_DIR="${OUTPUT_DIR:-./stage3-output}"
-MAX_STEPS="${MAX_STEPS:-3400}"
+# MAX_STEPS=auto (default): omit --max_steps and let train_sft.py compute the EXACT
+# one-epoch step count from the materialized (non-streaming) dataset length, so the
+# LR schedule and progress bar end precisely at data exhaustion. Set a number to
+# pin an explicit ceiling instead (e.g. MAX_STEPS=3400, the old streaming default).
+MAX_STEPS="${MAX_STEPS:-auto}"
 MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:-19456}"
 PER_DEVICE_BATCH_SIZE="${PER_DEVICE_BATCH_SIZE:-1}"
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-8}"
@@ -93,6 +106,12 @@ if [ -n "$S3_OUTPUT_DIR" ] && ! compgen -G "$OUTPUT_DIR/checkpoint-*" > /dev/nul
     fi
 fi
 
+if [ "$MAX_STEPS" = "auto" ]; then
+    MAX_STEPS_ARGS=()
+else
+    MAX_STEPS_ARGS=(--max_steps "$MAX_STEPS")
+fi
+
 torchrun --nproc_per_node="$NPROC" --tee 3 train_sft.py \
     --model_path "$MODEL_PATH" \
     --data_path "$DATA_PATH" \
@@ -111,7 +130,7 @@ torchrun --nproc_per_node="$NPROC" --tee 3 train_sft.py \
     --gradient_checkpointing \
     --dataloader_num_workers "$DATALOADER_NUM_WORKERS" \
     --num_train_epochs 1 \
-    --max_steps "$MAX_STEPS" \
+    "${MAX_STEPS_ARGS[@]}" \
     --learning_rate 8e-6 \
     --weight_decay 0.05 \
     --warmup_steps 102 \

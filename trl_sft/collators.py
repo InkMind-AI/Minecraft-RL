@@ -9,12 +9,16 @@
 
 from __future__ import annotations
 
+import io
 import logging
 import random
 from typing import Dict, List, Set
 
 import torch
+from PIL import Image
 from trl.trainer.sft_trainer import DataCollatorForVisionLanguageModeling
+
+from dataset import _resolve_chat_template_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +85,33 @@ def freeze_vision_tower(model: torch.nn.Module) -> None:
 # ─── immutable VLM collator adapter ───────────────────────────────────────────
 
 
+def _decode_raw_images(examples):
+    """Decode any raw-bytes entries in each example's `images` into PIL images, in place.
+
+    `dataset.py`'s samples carry `images` as the RAW encoded bytes (JPEG/PNG) exactly as
+    stored on disk -- this keeps the non-streaming Arrow cache byte-identical to the
+    source (no PNG re-encode / Image-feature blowup) and makes dataloader-worker pickling
+    cheap. TRL's `DataCollatorForVisionLanguageModeling` (which these collators feed into)
+    expects decoded PIL images, so every collator entry point decodes bytes -> PIL first.
+    Already-decoded images (PIL/other) pass through untouched, and rows without an
+    `images` key (e.g. --text_only) are skipped.
+
+    The map function already decode-validated every image at cache-build time (corrupt
+    bytes became a "[image]" text placeholder there), so a decode failure HERE would mean
+    corruption introduced after the map -- let it raise loudly rather than silently
+    producing a broken batch.
+    """
+    for example in examples:
+        images = example.get("images")
+        if not images:
+            continue
+        example["images"] = [
+            Image.open(io.BytesIO(img)).convert("RGB") if isinstance(img, (bytes, bytearray)) else img
+            for img in images
+        ]
+    return examples
+
+
 def _clone_conversation(messages):
     """Clone mutable chat containers while retaining immutable/PIL payload references."""
     if not isinstance(messages, list):
@@ -98,6 +129,21 @@ def _clone_conversation(messages):
     return cloned_messages
 
 
+def _inject_chat_template_kwargs(examples, chat_template_kwargs):
+    """Attach the dataset-level chat-template kwargs to every example, for TRL's collator.
+
+    `dataset.py` deliberately does NOT store `chat_template_kwargs` as a per-row column
+    (a dict column makes Arrow type inference unstable across map shards and crashes the
+    non-streaming materialization; the value depends only on the processor anyway -- see
+    dataset.py's `_CHAT_TEMPLATE_KWARGS` comment). TRL's VLM collator reads
+    `example["chat_template_kwargs"]` when rendering, so the collator injects it here.
+    `setdefault` keeps any pre-existing value (none today) authoritative.
+    """
+    for example in examples:
+        example.setdefault("chat_template_kwargs", chat_template_kwargs)
+    return examples
+
+
 class ImmutableVisionCollatorAdapter:
     """Give TRL's mutating VLM collator disposable sample containers.
 
@@ -111,6 +157,9 @@ class ImmutableVisionCollatorAdapter:
 
     def __init__(self, inner_collator):
         self.inner_collator = inner_collator
+        # Dataset-level chat-template kwargs, resolved from the inner TRL collator's
+        # own processor (e.g. Qwen3.x needs enable_thinking=False to match training).
+        self._chat_template_kwargs = _resolve_chat_template_kwargs(getattr(inner_collator, "processor", None))
 
     def __call__(self, examples):
         working_examples = []
@@ -122,6 +171,11 @@ class ImmutableVisionCollatorAdapter:
             if isinstance(working.get("images"), list):
                 working["images"] = list(working["images"])
             working_examples.append(working)
+        # dataset.py emits `images` as raw encoded bytes; the inner TRL collator
+        # expects decoded PIL images (see _decode_raw_images). Chat-template kwargs
+        # are injected here rather than stored per-row (see _inject_chat_template_kwargs).
+        working_examples = _decode_raw_images(working_examples)
+        working_examples = _inject_chat_template_kwargs(working_examples, self._chat_template_kwargs)
         return self.inner_collator(working_examples)
 
 
@@ -202,6 +256,11 @@ class MultiStepVLMCollator(DataCollatorForVisionLanguageModeling):
             raise ValueError(f"focal_decay must be in [0.0, 1.0], got {focal_decay}")
         self.focal_decay = focal_decay
         self._warned_empty_text = False
+        # Dataset-level chat-template kwargs (Qwen3.x enable_thinking=False), resolved
+        # from this collator's own processor -- injected per-example at collate time
+        # instead of being stored as an Arrow-unstable per-row column. See
+        # `_inject_chat_template_kwargs`.
+        self._chat_template_kwargs = _resolve_chat_template_kwargs(getattr(self, "processor", None))
         # Dedicated RNG so enabling/disabling focal never perturbs the global `random`
         # stream (which other data-pipeline code may rely on), and so the drop pattern
         # is reproducible for a given seed. Per-sample masks need not agree across
@@ -268,6 +327,16 @@ class MultiStepVLMCollator(DataCollatorForVisionLanguageModeling):
         if total_assistant and len(dropped) >= total_assistant:
             dropped.discard(assistant_idx)
         return dropped
+
+    def __call__(self, examples):
+        # dataset.py emits `images` as raw encoded bytes (Arrow-cache friendly); the
+        # parent TRL collator expects decoded PIL images. Decode BEFORE the parent's
+        # dispatch so both the parent's processing and our focal logic see PILs.
+        # Chat-template kwargs are injected here rather than stored per-row (see
+        # `_inject_chat_template_kwargs`).
+        examples = _decode_raw_images(examples)
+        examples = _inject_chat_template_kwargs(examples, self._chat_template_kwargs)
+        return super().__call__(examples)
 
     def _collate_language_modeling(self, examples):
         # Computed BEFORE `super()`, which injects decoded images into the examples'

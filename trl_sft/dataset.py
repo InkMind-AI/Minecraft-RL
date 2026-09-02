@@ -10,6 +10,20 @@ Supports two on-disk layouts:
 Also supports `text_only` mode (Stage I, no images) and `full_trajectory` mode
 (Stage III, multi-step loss on every assistant turn), plus `keep_no_op_p`
 (data-level no-op frame dropping, see `_is_no_op_action_text`).
+
+Non-streaming (`streaming=False`, now the default) materializes the dataset into
+an Arrow cache (known length -> exact-epoch max_steps, index-level resume skip,
+optional `num_proc` parallel preprocessing). Streaming (`--streaming`) keeps the
+legacy IterableDataset path (unknown length, sequential order, replays the whole
+map pipeline on every resume).
+
+Image contract (both modes): sample dicts carry `images` as the RAW encoded bytes
+(JPEG/PNG) exactly as stored on disk -- decoding to PIL happens in the collators
+(`collators.py::_decode_raw_images`). This keeps the non-streaming Arrow cache
+byte-identical to the source files (no PNG re-encode blowup, no Image-feature
+magic) and makes dataloader-worker pickling cheap. Images are still decoded once
+inside the map function purely to validate them (corrupt image -> "[image]" text
+fallback, same as before).
 """
 
 from __future__ import annotations
@@ -159,20 +173,32 @@ def _no_op_dropped_turns(
 # ─── dataset helpers ──────────────────────────────────────────────────────────
 
 
+def _decode_images(images: List[bytes]) -> List[Image.Image]:
+    """Decode the sample's raw `images` bytes into PIL images (transient use).
+
+    Only needed where PIL metadata (height/width) is required on the spot -- i.e.
+    the `_exceeds_max_length` pre-check inside `_row_to_trl_sample`. The training
+    samples themselves keep the raw bytes all the way to the collator (see the
+    module docstring's image contract).
+    """
+    return [Image.open(io.BytesIO(b)).convert("RGB") for b in images]
+
+
 def _split_prompt_completion_with_images(
     conversations: List[Dict],
     image_bytes_list: List[bytes],
-) -> Tuple[List[Dict], List[Dict], List[Image.Image]]:
+) -> Tuple[List[Dict], List[Dict], List[bytes]]:
     """
     Shared tail used by `build_messages_qa` (flat QA/jsonl rows): walks
-    `conversations`, keeps `{"type": "image"}` placeholders in-place while decoding
-    the matching entry of the flat `image_bytes_list` (one entry per placeholder, in
-    encounter order across the whole conversation) into a separate `images` list.
-    Finally splits off the final assistant turn as `completion`, with everything
-    before it as `prompt`.
+    `conversations`, keeps `{"type": "image"}` placeholders in-place while
+    validating the matching entry of the flat `image_bytes_list` (one entry per
+    placeholder, in encounter order across the whole conversation) and collecting
+    the RAW bytes into a separate `images` list (see the module docstring's image
+    contract; PIL decoding happens in the collators). Finally splits off the final
+    assistant turn as `completion`, with everything before it as `prompt`.
     """
     messages = []
-    images: List[Image.Image] = []
+    images: List[bytes] = []
     image_idx = 0
 
     for conv in conversations:
@@ -185,9 +211,9 @@ def _split_prompt_completion_with_images(
             elif item.get("type") == "image":
                 if image_idx < len(image_bytes_list):
                     try:
-                        img = Image.open(io.BytesIO(image_bytes_list[image_idx])).convert("RGB")
+                        Image.open(io.BytesIO(image_bytes_list[image_idx])).convert("RGB")  # validate only
                         content_list.append({"type": "image"})
-                        images.append(img)
+                        images.append(image_bytes_list[image_idx])
                     except Exception as e:
                         logger.warning(f"Failed to decode image at idx {image_idx}: {e}")
                         content_list.append({"type": "text", "text": "[image]"})
@@ -242,16 +268,18 @@ def _build_full_trajectory(
     image_bytes_list: List[bytes],
     keep_no_op_p: float = 1.0,
     rng: Optional[random.Random] = None,
-) -> Tuple[Optional[List[Dict]], Optional[List[Image.Image]]]:
+) -> Tuple[Optional[List[Dict]], Optional[List[bytes]]]:
     """One parquet trajectory row -> full (messages, images) for multi-step loss.
 
-    Mirrors `_split_prompt_completion_with_images` (same content normalization + image
-    decode) but keeps the WHOLE conversation: no prompt/completion split, so every
-    assistant "Action: ..." turn stays a training target for `_MultiStepVLMCollator`.
+    Mirrors `_split_prompt_completion_with_images` (same content normalization +
+    image validation) but keeps the WHOLE conversation: no prompt/completion split,
+    so every assistant "Action: ..." turn stays a training target for
+    `_MultiStepVLMCollator`. `images` carries the RAW encoded bytes (see the module
+    docstring's image contract).
 
     `keep_no_op_p < 1.0` additionally deletes no-op (observation, action) turn pairs
     outright -- OpenHA's `keep_no_op_p` applied at the data level; see
-    `_no_op_dropped_turns`. Dropped images are never decoded (only their index is
+    `_no_op_dropped_turns`. Dropped images are never validated (only their index is
     consumed), so this also makes the trajectory cheaper to preprocess AND shorter in
     vision tokens.
     """
@@ -280,8 +308,9 @@ def _build_full_trajectory(
                 # wrong frame's image.
                 if keep_turn and image_idx < len(image_bytes_list):
                     try:
-                        images.append(Image.open(io.BytesIO(image_bytes_list[image_idx])).convert("RGB"))
+                        Image.open(io.BytesIO(image_bytes_list[image_idx])).convert("RGB")  # validate only
                         content_list.append({"type": "image"})
+                        images.append(image_bytes_list[image_idx])
                     except Exception as e:
                         logger.warning(f"Failed to decode image at idx {image_idx}: {e}")
                         content_list.append({"type": "text", "text": "[image]"})
@@ -428,6 +457,14 @@ def build_messages_text_only(conversations: list) -> Tuple[Optional[List[Dict]],
 # actually references `enable_thinking` (Qwen3.x): passing it to a template that
 # doesn't (Qwen2-VL/Qwen2.5-VL) renders identically but trips a per-sample
 # `transformers` "kwargs not in processor_kwargs" warning -- avoided by gating on it.
+#
+# NOTE: the resolved kwargs are applied at COLLATE time (injected into each example by
+# `collators.py`), NOT stored as a per-row dataset column. A dict-typed column makes
+# Arrow's type inference unstable across map shards (empty dict -> Json, non-empty ->
+# struct; datasets 5.x additionally has a built-in expected type for a
+# "chat_template_kwargs" column), which hard-crashes the non-streaming map with
+# "features can't be aligned" -- and the value is a dataset-level constant anyway
+# (depends only on the processor), so per-row storage buys nothing.
 _CHAT_TEMPLATE_KWARGS: Dict = {"enable_thinking": False}
 
 
@@ -494,11 +531,10 @@ def _row_to_trl_sample(
     if text_only:
         prompt, completion = build_messages_text_only(conversations=sample["conversations"])
         if prompt is None:
-            return {"prompt": [], "completion": [], "chat_template_kwargs": {}, "_keep": False}
+            return {"prompt": [], "completion": [], "_keep": False}
         return {
             "prompt": prompt,
             "completion": completion,
-            "chat_template_kwargs": chat_template_kwargs,
             "_keep": True,
         }
 
@@ -515,11 +551,13 @@ def _row_to_trl_sample(
             rng=random.Random(f"{no_op_seed}:{idx}"),
         )
         if messages is None:
-            return {"messages": [], "images": [], "chat_template_kwargs": {}, "_keep": False}
+            return {"messages": [], "images": [], "_keep": False}
         if images and processor is not None and max_seq_length is not None:
-            if _exceeds_max_length(processor, messages[:-1], [messages[-1]], images, max_seq_length, chat_template_kwargs):
-                return {"messages": [], "images": [], "chat_template_kwargs": {}, "_keep": False}
-        return {"messages": messages, "images": images, "chat_template_kwargs": chat_template_kwargs, "_keep": True}
+            # `_exceeds_max_length` needs PIL sizes; decode transiently, emit raw bytes.
+            pil_images = _decode_images(images)
+            if _exceeds_max_length(processor, messages[:-1], [messages[-1]], pil_images, max_seq_length, chat_template_kwargs):
+                return {"messages": [], "images": [], "_keep": False}
+        return {"messages": messages, "images": images, "_keep": True}
 
     if data_format == "jsonl":
         prompt, completion, images = build_messages_qa(
@@ -528,10 +566,12 @@ def _row_to_trl_sample(
             image_root=image_root,
         )
         if prompt is None:
-            return {"prompt": [], "completion": [], "images": [], "chat_template_kwargs": {}, "_keep": False}
+            return {"prompt": [], "completion": [], "images": [], "_keep": False}
         if images and processor is not None and max_seq_length is not None:
-            if _exceeds_max_length(processor, prompt, completion, images, max_seq_length, chat_template_kwargs):
-                return {"prompt": [], "completion": [], "images": [], "chat_template_kwargs": {}, "_keep": False}
+            # `_exceeds_max_length` needs PIL sizes; decode transiently, emit raw bytes.
+            pil_images = _decode_images(images)
+            if _exceeds_max_length(processor, prompt, completion, pil_images, max_seq_length, chat_template_kwargs):
+                return {"prompt": [], "completion": [], "images": [], "_keep": False}
     else:
         # data_format == "parquet" with full_trajectory=False. `build_minecraft_dataset`
         # rejects this combination before ever calling `.map()` (see its own validation),
@@ -552,7 +592,6 @@ def _row_to_trl_sample(
         "prompt": prompt,
         "completion": completion,
         "images": images,
-        "chat_template_kwargs": chat_template_kwargs,
         "_keep": True,
     }
 
@@ -666,7 +705,12 @@ def _default_image_root(data_path: Union[str, List[str]]) -> str:
 _USED_COLUMNS = {"conversations", "image"}
 
 
-def _load_dataset_multi(builder_name: str, data_path: Union[str, List[str]], streaming: bool):
+def _load_dataset_multi(
+    builder_name: str,
+    data_path: Union[str, List[str]],
+    streaming: bool,
+    cache_dir: Optional[str] = None,
+):
     """`load_dataset(builder_name, data_files=data_path, split="train", streaming=...)`,
     except when `data_path` is a `list`: those files are loaded and trimmed to
     `_USED_COLUMNS` ONE AT A TIME then stitched with `concatenate_datasets`, instead of
@@ -680,13 +724,17 @@ def _load_dataset_multi(builder_name: str, data_path: Union[str, List[str]], str
     disagreeing file; loading each file separately never exposes pyarrow to more than
     one schema at a time, sidestepping this entirely (verified against the real 5-file
     Stage II combination).
+
+    `cache_dir` (non-streaming only) is where the materialized Arrow cache is written
+    -- point it at a big node-local SSD for the ~170GB stage3 parquet dataset (the
+    datasets default `~/.cache/huggingface` usually lives on a much smaller disk).
     """
     if not isinstance(data_path, list):
-        return load_dataset(builder_name, data_files=data_path, split="train", streaming=streaming)
+        return load_dataset(builder_name, data_files=data_path, split="train", streaming=streaming, cache_dir=cache_dir)
 
     per_file = []
     for path in data_path:
-        ds = load_dataset(builder_name, data_files=path, split="train", streaming=streaming)
+        ds = load_dataset(builder_name, data_files=path, split="train", streaming=streaming, cache_dir=cache_dir)
         drop = [c for c in ds.column_names if c not in _USED_COLUMNS]
         if drop:
             ds = ds.remove_columns(drop)
@@ -705,6 +753,8 @@ def build_minecraft_dataset(
     full_trajectory: bool = False,
     keep_no_op_p: float = 1.0,
     no_op_seed: int = 0,
+    num_proc: Optional[int] = None,
+    cache_dir: Optional[str] = None,
 ):
     """
     Build the Minecraft SFT dataset as a genuine `datasets.Dataset` (`streaming=False`)
@@ -763,6 +813,12 @@ def build_minecraft_dataset(
     (`keep_no_op_p=0` by default) and loss-level focal masking for the text-action route
     (`keep_no_op_p=1.0` by default). Measured on `minecraft-text-action-dataset`, 24.8% of
     assistant steps are pure no-ops, so e.g. `keep_no_op_p=0.2` removes ~20% of all steps.
+
+    `num_proc` (non-streaming only): worker processes for the one-time `.map()` cache
+    build. Falls back to single-process automatically if the map fn / `fn_kwargs` fail to
+    pickle. `cache_dir` (non-streaming only): where the materialized Arrow cache is
+    written -- for the ~170GB stage3 parquet dataset this MUST point at a big node-local
+    SSD (e.g. /local-ssd/hf_datasets_cache), not datasets' default ~/.cache/huggingface.
     """
     if data_format == "auto":
         data_format = _detect_data_format(data_path)
@@ -800,8 +856,10 @@ def build_minecraft_dataset(
         image_root = _default_image_root(data_path)
 
     builder_name = "parquet" if data_format == "parquet" else "json"
+    if streaming and num_proc:
+        logger.info("num_proc is not supported by IterableDataset.map(); ignoring it in streaming mode.")
     if streaming:
-        dataset = _load_dataset_multi(builder_name, data_path, streaming=True)
+        dataset = _load_dataset_multi(builder_name, data_path, streaming=True, cache_dir=cache_dir)
         # Return the complete HF IterableDataset. SFTTrainer/Accelerate shards it once
         # while preparing the DataLoader. Pre-sharding here caused double sharding:
         # N/world_size^2 samples per process and deterministic early stream exhaustion.
@@ -810,12 +868,12 @@ def build_minecraft_dataset(
             "process sharding is delegated to SFTTrainer/Accelerate"
         )
     else:
-        dataset = _load_dataset_multi(builder_name, data_path, streaming=False)
+        dataset = _load_dataset_multi(builder_name, data_path, streaming=False, cache_dir=cache_dir)
         logger.info(f"Dataset loaded (format={data_format}): {len(dataset)} samples")
 
     raw_columns = dataset.column_names
-    dataset = dataset.map(
-        _row_to_trl_sample,
+    map_kwargs = dict(
+        function=_row_to_trl_sample,
         with_indices=True,
         fn_kwargs={
             "data_format": data_format,
@@ -829,6 +887,30 @@ def build_minecraft_dataset(
         },
         remove_columns=raw_columns,
     )
-    dataset = dataset.filter(lambda x: x["_keep"])
+    if not streaming:
+        # `desc` (progress bar label) and `num_proc` exist only on `Dataset.map`,
+        # NOT on `IterableDataset.map` -- passing them in streaming mode raises.
+        map_kwargs["desc"] = "trl_sft map (decode/normalize/length-check)"
+        if num_proc and num_proc > 1:
+            map_kwargs["num_proc"] = num_proc
+    try:
+        dataset = dataset.map(**map_kwargs)
+    except Exception as e:
+        # Most likely cause: `fn_kwargs`' `processor` (or the map fn closure) failing
+        # to pickle across `num_proc` worker processes on some transformers/processor
+        # combinations. Fall back to single-process map rather than dying -- slower
+        # (the one-time cache build pays the whole cost serially) but correct.
+        if map_kwargs.pop("num_proc", None) is not None:
+            logger.warning(f"parallel .map(num_proc={num_proc}) failed ({e!r}); retrying single-process")
+            dataset = dataset.map(**map_kwargs)
+        else:
+            raise
+    dataset = dataset.filter(_keep_row)
     dataset = dataset.remove_columns(["_keep"])
     return dataset
+
+
+def _keep_row(example: Dict) -> bool:
+    """Filter predicate for `build_minecraft_dataset`'s `.filter()` -- a named function
+    (not a lambda) so it stays picklable for datasets' internal hashing."""
+    return bool(example["_keep"])
