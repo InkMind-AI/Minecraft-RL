@@ -178,7 +178,13 @@ class SequentialSFTTrainer(SFTTrainer):
     different code path (`_get_train_sampler` returns None / is unused).
     """
 
-    def _get_train_sampler(self):
+    def _get_train_sampler(self, *args, **kwargs):
+        # Signature intentionally permissive: some transformers/TRL versions call this
+        # with no argument (Trainer's `self._get_train_sampler()`), newer TRL versions
+        # pass the dataset positionally (`self._get_train_sampler(train_dataset)`) --
+        # a zero-arg override crashed the first real run with "takes 1 positional
+        # argument but 2 were given". Accept and ignore the argument(s): the Trainer
+        # always holds the same dataset on `self.train_dataset`.
         if self.train_dataset is None or not has_length(self.train_dataset):
             return None
         return SequentialSampler(self.train_dataset)
