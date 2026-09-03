@@ -17,10 +17,14 @@ import logging
 from openai import OpenAI
 from anthropic import Anthropic
 import torch
-from vllm import LLM, SamplingParams
-
+# NOTE: vllm is imported LAZILY (inside _init_offline_vllm_backend/_generate_offline_vllm),
+# not at module top level: a top-level `from vllm import ...` forces every consumer of
+# this module (including the "hf" transformers-in-process backend and the "online" HTTP
+# client, neither of which touches vllm) to have a working vllm install -- which breaks
+# e.g. an env where transformers was upgraded past the vllm pin (vllm imports fail).
 from transformers import (
     AutoTokenizer,
+    AutoProcessor,
     AutoModelForImageTextToText,
     Qwen2VLProcessor,
     Qwen2_5_VLProcessor,
@@ -200,6 +204,7 @@ class VLMClient(object):
 
     def _init_offline_vllm_backend(self) -> None:
         """Initialise local vLLM engine."""
+        from vllm import LLM  # lazy: see module-header NOTE
         self.model = LLM(
             model=self.model_path,
             tensor_parallel_size=self._TP_SIZE_DEFAULT,
@@ -264,6 +269,11 @@ class VLMClient(object):
                 **model_kwargs,
             ).eval()
         else:
+            # Generic backbone (e.g. Qwen3.5's hybrid linear/full attention): Auto
+            # classes resolve the right model AND processor from the checkpoint's own
+            # config. Without the AutoProcessor here, `self.processor` would be
+            # undefined and `_generate_local_hf` would crash on its first call.
+            self.processor = AutoProcessor.from_pretrained(self.model_path, trust_remote_code=True)
             self.model = AutoModelForImageTextToText.from_pretrained(
                 self.model_path,
                 trust_remote_code=True,
@@ -404,6 +414,7 @@ class VLMClient(object):
         if self.top_logprobs:
             gen_kwargs.update({"top_logprobs": self.top_logprobs, "logprobs": True})
 
+        from vllm import SamplingParams  # lazy: see module-header NOTE
         sampling = SamplingParams(
             max_tokens=self.max_tokens,
             temperature=self.temperature,
@@ -472,7 +483,15 @@ class VLMClient(object):
                     images.append(img)
         if not images:
             images = None
-        text_prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True)
+        # Forward chat_template_kwargs (e.g. Qwen3.x {"enable_thinking": false}) the
+        # same way the online/vllm backends do via extra_body -- without this, hf-mode
+        # eval of a Qwen3.x checkpoint would render the prompt with thinking enabled
+        # (a distribution the model was never trained on) and pollute the action
+        # stream with <think> blocks. See run_backbone_eval.sh's EXTRA_BODY_JSON note.
+        chat_template_kwargs = (self.extra_body or {}).get("chat_template_kwargs", {})
+        text_prompt = self.processor.apply_chat_template(
+            messages, add_generation_prompt=True, **chat_template_kwargs
+        )
         inputs = self.processor(text=[text_prompt], images=images, padding=True, return_tensors="pt").to(self.model.device)
         input_len = inputs["input_ids"].shape[-1]
 
@@ -486,7 +505,11 @@ class VLMClient(object):
             gen_cfg["top_k"] = self.top_k
         output_ids = self.model.generate(
             **inputs,
-            max_new_tokens=self.max_tokens - input_len,
+            # Parity with the online backend: max_tokens there caps NEW tokens
+            # (vLLM/OpenAI semantics); the old `self.max_tokens - input_len` made hf
+            # mode silently generate fewer tokens than online mode for the same
+            # max_tokens setting.
+            max_new_tokens=self.max_tokens,
             **gen_cfg,
             pad_token_id=self.processor.tokenizer.eos_token_id,
             eos_token_id=self.processor.tokenizer.eos_token_id,
