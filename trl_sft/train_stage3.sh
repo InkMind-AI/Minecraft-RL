@@ -51,6 +51,12 @@ FOCAL_DECAY="${FOCAL_DECAY:-0.75}"
 # alone. Set e.g. KEEP_NO_OP_P=0.2 to additionally remove ~80% of the 24.8% pure-no-op
 # steps, matching VPT's "skip null actions" data pipeline more closely.
 KEEP_NO_OP_P="${KEEP_NO_OP_P:-1.0}"
+# Continue-SFT / pilot 覆写参数（默认值 = 历史 stage3 正式训练值，行为不变）：
+LEARNING_RATE="${LEARNING_RATE:-8e-6}"
+NUM_EPOCHS="${NUM_EPOCHS:-1}"
+SAVE_STEPS="${SAVE_STEPS:-200}"
+WARMUP_STEPS="${WARMUP_STEPS:-102}"
+SHUFFLE="${SHUFFLE:-0}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
@@ -129,12 +135,13 @@ torchrun --nproc_per_node="$NPROC" --tee 3 train_sft.py \
     --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS" \
     --gradient_checkpointing \
     --dataloader_num_workers "$DATALOADER_NUM_WORKERS" \
-    --num_train_epochs 1 \
+    --num_train_epochs "$NUM_EPOCHS" \
     "${MAX_STEPS_ARGS[@]}" \
-    --learning_rate 8e-6 \
+    --learning_rate "$LEARNING_RATE" \
     --weight_decay 0.05 \
-    --warmup_steps 102 \
+    --warmup_steps "$WARMUP_STEPS" \
     --lr_scheduler_type cosine \
     --deepspeed ds_zero2_no_offload.json \
-    --save_steps 200 \
-    --logging_steps 10
+    --save_steps "$SAVE_STEPS" \
+    --logging_steps 10 \
+    $( [ "$SHUFFLE" = "1" ] && echo --shuffle )

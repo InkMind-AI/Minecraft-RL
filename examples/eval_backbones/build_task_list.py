@@ -12,6 +12,10 @@
     python build_task_list.py --scope mini            # 30个代表性任务：每类10个，
                                                         # 按 easy/middle/hard 均分
     python build_task_list.py --scope full             # 全部 800+ 个任务(单一难度)
+    python build_task_list.py --scope easy             # 非 GUI 任务(Embodied 153 +
+                                                        # Combat 49，共202个)全量，
+                                                        # 统一 difficulty=easy，可用
+                                                        # --num_tasks/--easy_difficulty 调整
 
 输出（stdout）：空格分隔的 "task_name@difficulty" token 序列，可直接赋给
 run_backbone_eval.sh 的 TASK_DIFFICULTY_LIST 环境变量。若设置了环境变量
@@ -65,18 +69,36 @@ def pick_full(tasks_by_cat, difficulty):
     return [(cat, t, difficulty) for cat, tasks in tasks_by_cat.items() for t in tasks]
 
 
+def pick_easy(tasks_by_cat, num_tasks, difficulty, seed):
+    """从非 GUI 类别(Embodied/Combat)采样 num_tasks 个任务，统一使用同一难度。
+
+    用于"大量简单任务"型高统计功效评测（如 300 任务 x 3 rollout 全 easy）。
+    GUI 类完全排除：当前所有 checkpoint 的 GUI 成功率均为 0%，纳入只会浪费
+    rollout 且不产生区分信号。非 GUI 池共 202 个任务(Embodied 153 + Combat 49)，
+    num_tasks 超过池大小时自动取全量。若未来 GUI 能力不再为 0，应恢复纳入。
+    """
+    rng = random.Random(seed)
+    pool = [(cat, t) for cat, tasks in tasks_by_cat.items() if cat != "GUI" for t in tasks]
+    chosen = rng.sample(pool, min(num_tasks, len(pool)))
+    return [(cat, t, difficulty) for cat, t in chosen]
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--scope", choices=["mini", "full"], default="mini")
+    ap.add_argument("--scope", choices=["mini", "full", "easy"], default="mini")
     ap.add_argument("--per_category", type=int, default=10, help="mini scope: 每类任务数")
-    ap.add_argument("--seed", type=int, default=42, help="mini scope: 任务采样随机种子(保证可复现)")
+    ap.add_argument("--seed", type=int, default=42, help="mini/easy scope: 任务采样随机种子(保证可复现)")
     ap.add_argument("--full_difficulty", default="normal", help="full scope: 所有任务统一难度")
+    ap.add_argument("--num_tasks", type=int, default=300, help="easy scope: 采样任务总数")
+    ap.add_argument("--easy_difficulty", default="easy", help="easy scope: 所有任务统一难度")
     args = ap.parse_args()
 
     tasks_by_cat = load_tasks_by_category()
 
     if args.scope == "mini":
         picked = pick_mini(tasks_by_cat, args.per_category, args.seed)
+    elif args.scope == "easy":
+        picked = pick_easy(tasks_by_cat, args.num_tasks, args.easy_difficulty, args.seed)
     else:
         picked = pick_full(tasks_by_cat, args.full_difficulty)
 

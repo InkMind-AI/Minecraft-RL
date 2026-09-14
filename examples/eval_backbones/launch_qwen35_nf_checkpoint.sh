@@ -19,7 +19,8 @@ set -o pipefail
 : "${NOOP_TAG:?must set NOOP_TAG (2, 5, or 7), e.g. NOOP_TAG=5 CKPT=400 bash $0}"
 : "${CKPT:?must set CKPT, e.g. CKPT=400 bash $0}"
 
-export MODEL_LOCAL_NAME="q35nf${NOOP_TAG}-ckpt${CKPT}-20260902"
+# MODEL_LOCAL_NAME 可外部覆盖：复评（如加大 rollouts）时指定新名字，避免覆盖旧结果目录
+export MODEL_LOCAL_NAME="${MODEL_LOCAL_NAME:-q35nf${NOOP_TAG}-ckpt${CKPT}-20260902}"
 export MODEL_S3_URI="s3://arcwm-code-us-west-2/axiom/model/minecraft-sft-stage3-qwen35-9b-nf-noop${NOOP_TAG}/checkpoint-${CKPT}/"
 export SERVED_MODEL_NAME="eval-q35nf${NOOP_TAG}-ckpt${CKPT}"
 export VLLM_CONDA_ENV="vllm35"   # Qwen3.5 混合线性/全注意力架构，需 vllm>=0.17.0，单独装环境

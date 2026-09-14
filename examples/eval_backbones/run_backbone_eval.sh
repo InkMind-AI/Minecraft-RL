@@ -31,7 +31,11 @@ set -o pipefail
 #   smoke        - 3个任务、difficulty=zero 的快速烟雾测试(仅用于验证环境/代码
 #                  改动是否能跑通，不用于产出可比较的评测数值)
 #   full         - 全部 800+ 个任务(单一difficulty=normal)，对应论文完整benchmark
-# mini/full 模式下会用 build_task_list.py 自动生成 TASK_DIFFICULTY_LIST(逐任务
+#   easy         - 非 GUI 任务全量(Embodied 153 + Combat 49 = 202个，seed=42固定)，
+#                  统一 difficulty=easy。GUI 完全排除：当前所有 checkpoint GUI
+#                  成功率均为 0%，纳入只浪费 rollout。用于高统计功效评测，
+#                  如 202任务 x 3 rollout。GUI 能力恢复后应重新纳入。
+# mini/full/easy 模式下会用 build_task_list.py 自动生成 TASK_DIFFICULTY_LIST(逐任务
 # 独立难度)，取代下面的 TASK_LIST + 全局 DIFFICULTY 组合。手动设置了
 # TASK_LIST或TASK_DIFFICULTY_LIST 的话，其优先级更高（用于调试单个任务）。
 export EVAL_BENCHMARK=${EVAL_BENCHMARK:-mini}
@@ -99,7 +103,7 @@ mkdir -p "${LOCAL_MODEL_DIR}" "${RECORD_ROOT}" "${LOG_DIR}" "${MINESTUDIO_DIR}"
 if [ "${EVAL_BENCHMARK}" != "smoke" ] && [ -z "${TASK_DIFFICULTY_LIST}" ]; then
     echo "[task-list] generating EVAL_BENCHMARK=${EVAL_BENCHMARK} task list via build_task_list.py"
     export TASK_LIST_MANIFEST="${RECORD_ROOT}/task_list_manifest.json"
-    TASK_DIFFICULTY_LIST="$(python3 "$(dirname "${BASH_SOURCE[0]}")/build_task_list.py" --scope "${EVAL_BENCHMARK}")"
+    TASK_DIFFICULTY_LIST="$(python3 "$(dirname "${BASH_SOURCE[0]}")/build_task_list.py" --scope "${EVAL_BENCHMARK}" --easy_difficulty "${EASY_DIFFICULTY:-easy}" --num_tasks "${EASY_NUM_TASKS:-300}")"
     export TASK_DIFFICULTY_LIST
     echo "[task-list] $(echo "${TASK_DIFFICULTY_LIST}" | wc -w) tasks, manifest -> ${TASK_LIST_MANIFEST}"
 fi
@@ -443,6 +447,7 @@ conda run --no-capture-output -n "${VLLM_CONDA_ENV}" vllm serve "${LOCAL_MODEL_D
     --port "${VLLM_PORT}" \
     --limit-mm-per-prompt "${LIMIT_MM_ARG}" \
     --trust-remote-code --gpu-memory-utilization "${GPU_MEM_UTIL}" \
+    --enable-prefix-caching \
     --pipeline-parallel-size 1 \
     --tensor-parallel-size "${TP_SIZE}" \
     --max-num-seqs 16 \
