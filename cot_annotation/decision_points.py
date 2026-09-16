@@ -70,3 +70,47 @@ def thought_points(actions: List[str], min_gap: int = 2, use_r4: bool = False) -
             pts.append(t)
             last = t
     return pts
+
+
+# ─── 确定性 phase 分类（09-16，结构化 CoT 试点：零 LLM、零幻觉风险）───────────
+# 只依赖动作语义本身，不依赖任何视觉/结果判断，因此 100% 可复现、不存在标注对错。
+PHASE_ORDER = ("engage", "collect", "interact", "approach", "reposition", "wait")
+
+
+def action_phase(sem: ActionSem) -> str:
+    """把单步动作语义映射到闭合词表的 phase 标签（确定性规则，非 LLM）。"""
+    if sem.is_noop:
+        return "wait"
+    if sem.click == "L":
+        return "engage"       # 左键：攻击/挖掘
+    if sem.click == "R":
+        return "interact"     # 右键：使用/放置/交互
+    moving = bool(sem.keys & {"w", "a", "s", "d"})
+    if moving and sem.bucket >= 2:
+        return "approach"     # 移动 + 较大视角调整：朝目标靠近/搜索
+    if moving:
+        return "reposition"   # 移动但视角变化小：走位微调
+    return "reposition"       # 纯视角调整、无移动无点击
+
+
+def extract_target(instruction: str) -> str:
+    """从任务指令确定性提取目标名词短语（正则，非 LLM，零幻觉风险）。
+
+    真实指令句式多样（"Break the brewing stand to collect it."/"Mine the jungle
+    log in the rainforest biome."），核心名词短语夹在动词短语与从句/介词短语之间。
+    策略：动词+冠词后，抓 1-4 个词，遇到从句连接词（to/for/from/in/at/using/by/
+    into/on/with/back/at）或句末即停止。匹配失败时退化为整句下划线化（宁可噪声
+    大，不可静默失败——下游训练侧目标不精确不影响 phase/visible 两个核心字段）。
+    """
+    s = instruction.strip().rstrip(".")
+    m = re.search(
+        r"(?:kill|mine|break|attack|collect|gather|get|harvest|recycle|craft|"
+        r"create|open|use|smelt|find|approach)\w*\s+"
+        r"(?:the\s+|a\s+|an\s+|some\s+)?"
+        r"([a-zA-Z_]+(?:\s+[a-zA-Z_]+){0,3}?)"
+        r"(?=\s+(?:to|for|from|in|at|using|by|into|on|with|back|and)\b|$)",
+        s, re.I)
+    if m and m.group(1).strip().lower() not in ("it", "them", "one"):
+        return m.group(1).strip().lower().replace(" ", "_")
+    return re.sub(r"\s+", "_", s.lower())
+
