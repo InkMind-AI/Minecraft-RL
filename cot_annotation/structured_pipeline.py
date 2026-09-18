@@ -81,7 +81,11 @@ def render_struct_row(row: Dict[str, Any], instruction: str, actions: List[str],
 
 
 def run_structured(rows: List[Dict[str, Any]], annotator=None, n_workers: int = 8,
-                   checkpoint_dir: str = None):
+                   checkpoint_dir: str = None, density: str = "decision"):
+    """density:
+    - decision: 决策点检测器（~12%，现状）
+    - every:    每步都标注（100%，ECoT式感知头——触发问题被设计消解）
+    """
     import time as _time
     annotator = annotator or get_annotator()
     stats = {"n_rows": 0, "n_decision_points": 0, "n_labels_ok": 0,
@@ -92,7 +96,10 @@ def run_structured(rows: List[Dict[str, Any]], annotator=None, n_workers: int = 
         instruction, actions, convs = extract_row_fields(row)
         if len(actions) < 10 or not row.get("image_bytes"):
             return None, dict(n_pts=0, n_ok=0, n_vis=0)
-        pts = thought_points(actions, min_gap=2, use_r4=False)
+        if density == "every":
+            pts = list(range(len(actions)))
+        else:
+            pts = thought_points(actions, min_gap=2, use_r4=False)
         if not pts:
             return None, dict(n_pts=0, n_ok=0, n_vis=0)
         payload = build_struct_payload(instruction, actions, pts, row["image_bytes"])
@@ -140,6 +147,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--limit", type=int, default=300)
     ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--density", choices=["decision", "every"], default="decision")
     args = ap.parse_args()
 
     import pyarrow.parquet as pq
@@ -173,7 +181,8 @@ def main():
     rows = rows[:args.limit]
 
     annotated, stats = run_structured(rows, n_workers=args.workers,
-                                      checkpoint_dir=os.path.join(args.out, "ckpt"))
+                                      checkpoint_dir=os.path.join(args.out, "ckpt"),
+                                      density=args.density)
     os.makedirs(args.out, exist_ok=True)
     with open(os.path.join(args.out, "annotated.pkl"), "wb") as f:
         pickle.dump(annotated, f)
