@@ -302,6 +302,8 @@
 
 **automations 不可靠**：定时自动化在本环境持续超时（11 次失败记录），所有关键提交已改为人工执行——依赖自动化的操作一律视为不可靠
 
+**09-19 conda 锁冲突批量评测失败**：10 路评测（sdense×5 + sstack×5）秒级内连续提交，触发 `conda: database is locked`（多任务并发装环境撞共享缓存）——5 个 sdense 全部倒在环境安装阶段（卡死超时踢出），sstack-e2 环境损坏级联到 `java: not found`（Malmo 启动失败，0 rollout）；其余 4 个 sstack（e1/e3/e4/e5）安装顺利、未受影响。修复：错峰重提（间隔 30s），6 个失败任务已补交（`sdns2-e*` / `sstk2-e2`）。**结论：与 CoT 数据/训练本身无关，纯提交时序的基础设施问题**——后续批量提交默认加 30s 间隔。
+
 **09-09 存储清理（释放 ~10.1TB）**：删除 5 个模型（noop01 / nf2-nofocal / nf2-fd09 / fd05 / fd09）的 72 个中间 checkpoint（每 200 步的训练断点，各 140GB 含优化器状态）。保留原则：所有有评测记录或在途评测的 checkpoint 一个不删（最终 checkpoint 全保留 + 有 c1000 成绩的保留 c1000）。可选后续：保留的 25 个 checkpoint 内还有 ~121GB/个 的优化器状态（~2.9TB），若确认不做 continue-SFT 断点恢复可再清。
 
 **09-14 存储清理（释放 ~8TB，P1 闭合后执行）**：
@@ -450,7 +452,13 @@ Thought: target=<确定性正则提取> visible=<bool> region=<center|left|right
 1. **数据暴露增益在 normal 上更稳健**：ctrl 相对基线 +7.5pp（比 easy 的 +6.6pp 还大）——continue-SFT 的收益不是 easy 特有的，跨难度成立，全量数据训练的信心增加
 2. **thought 的危害随难度恶化，推翻了此前"难题更能体现CoT价值"的假设**：v2 的 Combat 在 normal 上暴跌到 11.8%（比 easy 的 23.1% 还差一半），远低于基线的 20.6%——任务链路变长后，思考步骤中的干扰有更多机会累积/被历史回放放大。这是对"事后合理化自由文本 CoT"路线的又一次独立证伪，且方向与直觉相反
 
-结构化 CoT 试点（`cot-struct-v0`）5 epoch 评测已提交，将在此难度结论基础上给出最终判词。
+### hard 难度全量出分（09-19）
+
+| 模型 | hard | Embodied | Combat |
+|---|---|---|---|
+| 基线（nf2-c3000） | **15.2%** | 18.3% | **5.4%** |
+
+对比 easy 24.9% / normal 22.9% / hard 15.2%——三点曲线成立，衰减非线性（easy→normal -2.0pp，normal→hard -7.7pp，hard 是断层）。Combat 从 normal 的 20.6% 暴跌到 5.4%，是 hard 难度的主要拖累项。ctrl-e5 的 hard 评测因 conda 锁事故重跑中，出分后补齐"数据暴露增益是否在 hard 上依然稳健"的答案。
 
 ### v2 出分与四方终版归因（09-15 下午）
 
