@@ -30,14 +30,13 @@ import torch
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 
-from train_sft import (  # noqa: E402
-    load_model_and_processor,
-    build_minecraft_dataset,
-)
+from train_sft import _load_model_and_processor as load_model_and_processor  # noqa: E402
+from dataset import build_minecraft_dataset  # noqa: E402
 from collators import MultiStepVLMCollator  # noqa: E402
 
-import deepspeed  # noqa: E402
 import numpy as np  # noqa: E402
+# deepspeed 只在 main() 里用——顶层不 import，使 token_logprobs_from_logits 等纯
+# tensor 工具函数能在无 deepspeed 的环境（如本地 CPU 冒烟测试）独立导入验证。
 
 
 def token_logprobs_from_logits(logits: torch.Tensor, labels: torch.Tensor,
@@ -77,6 +76,8 @@ def build_args():
     ap.add_argument("--deepspeed", default=os.path.join(SCRIPT_DIR, "ds_zero2_no_offload.json"))
     ap.add_argument("--attn_implementation", default="flash_attention_2")
     ap.add_argument("--freeze_vision_tower", action="store_true", default=True)
+    ap.add_argument("--download_model", default=None,
+                    help="S3 模型本地缓存目录，透传给 train_sft._load_model_and_processor")
     ap.add_argument("--max_seq_length", type=int, default=19456)
     ap.add_argument("--per_device_batch_size", type=int, default=1)
     ap.add_argument("--gradient_accumulation_steps", type=int, default=8)
@@ -96,6 +97,8 @@ def build_args():
 
 
 def main():
+    import deepspeed  # 延迟导入：训练入口才需要，见顶部说明
+
     args = build_args()
     torch.manual_seed(args.seed)
 
