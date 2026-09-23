@@ -40,28 +40,38 @@ import numpy as np  # noqa: E402
 
 
 def token_logprobs_from_logits(logits: torch.Tensor, labels: torch.Tensor,
-                               chunk: int = 2048) -> tuple:
-    """逐 chunk 计算 label 位置的 logprob（fp32 logsumexp 保数值稳定）。
+                               chunk: int = 1024) -> tuple:
+    """逐 chunk 计算 label 位置的 logprob。
 
-    logits: [B, T, V]（bf16），labels: [B, T]（-100 = 非生成位置，已与 logits 对齐
-    ——调用方需保证传入的 labels 已做过 shift）。
-    返回 (logp_sum_per_sample [B], token_mask_sum_per_sample [B])
+    ⚠ 用 F.cross_entropy（fused kernel），不要改成 log_softmax+gather：
+    后者会 materialize [chunk, V] 的 fp32 softmax 中间量并常驻计算图
+    （19k token × 152k 词表 ≈ +23GB/卡），是 8 卡 ZeRO2 下 OOM 的直接
+    原因（09-22 test7 实测：静态 ~34GB 却占满 134GB）。CE 的 backward
+    也是 fused 路径，中间量不驻留。lg 为 logits 的 view，不占新内存。
+
+    logits: [B, T, V]（bf16），labels: [B, T]（-100 = 非生成位置，已 shift）
+    返回 (logp_sum_per_sample [B] fp32, token_mask_sum_per_sample [B] fp32)
     """
+    import torch.nn.functional as F
     B = logits.shape[0]
     logp_sum = torch.zeros(B, device=logits.device, dtype=torch.float32)
     n_tok = torch.zeros(B, device=logits.device, dtype=torch.float32)
     T = logits.shape[1]
+    V = logits.shape[-1]
     for s in range(0, T, chunk):
         e = min(s + chunk, T)
-        lg = logits[:, s:e].float()
+        lg = logits[:, s:e]  # view
         lb = labels[:, s:e]
         mask = lb != -100
         if not mask.any():
             continue
-        logp = torch.log_softmax(lg, dim=-1)
-        gathered = logp.gather(-1, lb.clamp(min=0).unsqueeze(-1)).squeeze(-1)
-        gathered = gathered * mask
-        logp_sum += gathered.sum(dim=-1)
+        # bf16 输入的 CE 内部 fp32 累加（logsumexp），相对误差 ~0.4%/token，
+        # 对 RL 的 advantage 加权损失足够（verl/TRL 的 GRPO 实现同为 bf16）
+        ce = F.cross_entropy(
+            lg.reshape(-1, V), lb.reshape(-1).clamp(min=0),
+            reduction='none').view(lb.shape)
+        ce = ce * mask
+        logp_sum += (-ce).sum(dim=-1)
         n_tok += mask.sum(dim=-1).float()
     return logp_sum, n_tok
 
@@ -75,6 +85,8 @@ def build_args():
     ap.add_argument("--s3_output_dir", default=None)
     ap.add_argument("--deepspeed", default=os.path.join(SCRIPT_DIR, "ds_zero2_no_offload.json"))
     ap.add_argument("--attn_implementation", default="flash_attention_2")
+    ap.add_argument("--optimizer_cpu_offload", action="store_true",
+                    help="ZeRO2 优化器状态 offload 到 CPU（冒烟测试用，不改训练数学）")
     ap.add_argument("--freeze_vision_tower", action="store_true", default=True)
     ap.add_argument("--download_model", default=None,
                     help="S3 模型本地缓存目录，透传给 train_sft._load_model_and_processor")
@@ -103,7 +115,13 @@ def main():
     torch.manual_seed(args.seed)
 
     model, processor = load_model_and_processor(args)
-    model.gradient_checkpointing_enable()
+    # ⚠ 冻结 vision tower 后 ViT 输出无 grad，默认 reentrant 模式的 checkpoint
+    # 会静默失效（36 层激活全量 materialize ≈130GB → OOM，09-22 test7/8 实测
+    # 135GB 爆满的根因）。必须用 non-reentrant + 显式让输入链有 grad（HF 对
+    # "冻结 embedding/ViT + gradient checkpointing" 的标准修复）。
+    model.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False})
+    model.enable_input_require_grads()
     model.config.use_cache = False
 
     ref_model = None
@@ -131,6 +149,9 @@ def main():
         "gradient_clipping": 1.0,
         "zero_optimization": {"stage": 2},
     }
+    if args.optimizer_cpu_offload:
+        ds_config["zero_optimization"]["offload_optimizer"] = {
+            "device": "cpu", "pin_memory": True}
     engine, _, _, _ = deepspeed.initialize(
         model=model, config=ds_config, model_parameters=model.parameters())
 

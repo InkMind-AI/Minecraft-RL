@@ -67,6 +67,16 @@ export GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.90}
 export TP_SIZE=${TP_SIZE:-1}
 export GPU_PER_ROLLOUT=${GPU_PER_ROLLOUT:-0.1}
 export VLLM_PORT=${VLLM_PORT:-11000}
+# ReST-EM 自举 rollout 用：强制每步以 "Thought: " 续写（复用 OpenHA 已有的
+# enforce_format/enforce_prefix 机制，见 openha.py gen_response）。默认关闭，
+# 不设置时两处 rollout_openha.py 调用都传空字符串，enforce_format=bool("")=False，
+# 与改动前的评测行为逐字节一致。决策点密度过滤在下游 rl_build_batch.py 做
+# （见其 --strip-non-decision-thought），这里只负责"每步都强制生成一个候选"。
+export FORCE_THOUGHT=${FORCE_THOUGHT:-}
+export FORCE_THOUGHT_PREFIX=${FORCE_THOUGHT_PREFIX:-}
+if [ -n "${FORCE_THOUGHT}" ]; then
+    export FORCE_THOUGHT_PREFIX=${FORCE_THOUGHT_PREFIX:-"Thought: "}
+fi
 # Passed through to rollout_openha.py -> OpenHA(**kwargs) -> VLMClient(extra_body=...)
 # -> the OpenAI-compatible `chat.completions.create(extra_body=...)` call, which vLLM
 # forwards into `tokenizer.apply_chat_template(..., **chat_template_kwargs)`.
@@ -515,6 +525,8 @@ if [ -n "${TASK_DIFFICULTY_LIST}" ]; then
             --gpu_per_rollout "${GPU_PER_ROLLOUT}" \
             --num_rollouts "${ROLLOUTS_PER_TASK}" \
             --extra_body "${EXTRA_BODY_JSON}" \
+            --enforce_format "${FORCE_THOUGHT}" \
+            --enforce_prefix "${FORCE_THOUGHT_PREFIX}" \
             2>&1 | tee -a "${LOG_DIR}/rollout_${TASK//[:,]/_}.log"
     done
 else
@@ -542,6 +554,8 @@ else
             --gpu_per_rollout "${GPU_PER_ROLLOUT}" \
             --num_rollouts "${ROLLOUTS_PER_TASK}" \
             --extra_body "${EXTRA_BODY_JSON}" \
+            --enforce_format "${FORCE_THOUGHT}" \
+            --enforce_prefix "${FORCE_THOUGHT_PREFIX}" \
             2>&1 | tee -a "${LOG_DIR}/rollout_${TASK//[:,]/_}.log"
     done
 fi

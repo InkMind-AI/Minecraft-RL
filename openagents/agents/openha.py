@@ -146,7 +146,21 @@ class OpenHA(VLMClient, base_agent.MineCraftAgent):
             assert output_mode in OUTPUT_FORMAT_MODE_MAP[output_format]
         self._output_format = output_format
         if enforce_format:
-            assert vlm_client_mode=="vllm", f"use enforce_format, only support vllm, but you use {vlm_client_mode}"
+            # 09-22（ReST-EM 自举需求）：原实现只支持本地 vlm_client_mode="vllm"
+            # （直接拼 prompt 字符串续写）。评测/rollout 全链路（run_backbone_eval.sh
+            # -> rollout_openha.py --vlm_client_mode online）走的是 OpenAI 兼容 HTTP
+            # 客户端打 vLLM 服务端，不是本地 vllm.LLM 对象——之前的 assert 会让每个
+            # episode 在构造 agent 时就崩掉（09-22 bootstrap-iter1b 实测：全部 rollout
+            # 静默失败退化为0结果，见 rl_grpo_design.md 自举章节的事故记录）。
+            # vLLM 的 OpenAI 兼容服务端本身支持 continue_final_message（把最后一条
+            # assistant 消息当续写前缀，而非当完整历史）+ add_generation_prompt=False
+            # （不再追加新的生成提示模板），二者组合实现与本地模式等价的前缀强制，
+            # 因此这里放开到同时支持 "online"。
+            assert vlm_client_mode in ("vllm", "online"), \
+                f"use enforce_format, only support vllm/online, but you use {vlm_client_mode}"
+            if vlm_client_mode == "online":
+                self.extra_body["continue_final_message"] = True
+                self.extra_body["add_generation_prompt"] = False
             self.enforce_prefix = enforce_prefix
             if not enforce_prefix:
                 if output_format in {"grounding_coa", "grounding"}:

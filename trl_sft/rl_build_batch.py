@@ -25,6 +25,9 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from thought_consistency import strip_and_score  # noqa: E402
+
 # 早停判定：评测 harness 任务完成即终止（MAX_STEPS_NUM=200）
 SUCCESS_MAX_FRAMES = 180
 
@@ -134,6 +137,13 @@ def main():
     ap.add_argument("--window", type=int, default=29,
                     help="切窗步数，对齐 MAXIMUM_HISTORY_LENGTH（h29）——见"
                          " windows_from_episode 的长度过滤事故记录")
+    ap.add_argument("--strip-non-decision-thought", action="store_true",
+                    help="ReST-EM 自举模式：配合 rollout 时的 FORCE_THOUGHT=1，"
+                         "只在回溯检测出的决策点保留 Thought，非决策点剥回纯 "
+                         "Action；同时输出 --thought-signal 信号2打分")
+    ap.add_argument("--thought-signal", default=None,
+                    help="信号2（言行一致）打分输出 npy，与 parquet 行序对齐；"
+                         "仅 --strip-non-decision-thought 时生效，未设置则不输出")
     args = ap.parse_args()
 
     # ⚠ 不可 .strip()：权威拼接方式见 openha.py:325 `self.system_message + instruction`
@@ -141,7 +151,8 @@ def main():
     # （"...## User Instruction\n"），指令直接续接、中间无额外分隔——strip() 会吃掉这个
     # 换行导致标题与指令粘连。09-20 冒烟测试曾捕获此 bug，务必保留本注释防止回归。
     system_prompt = open(args.system_prompt).read()
-    rows, rewards, groups = [], [], []
+    rows, rewards, groups, thought_factors = [], [], [], []
+    n_dpts_total, n_dpts_scored, score_sum = 0, 0, 0.0
     for task_dir in sorted(os.listdir(args.eval_output)):
         task_path = os.path.join(args.eval_output, task_dir)
         if not os.path.isdir(task_path):
@@ -157,6 +168,19 @@ def main():
             if len(frames) < 5 or not responses:
                 continue
             episode_reward = 1.0 if len(frames) < SUCCESS_MAX_FRAMES else 0.0
+
+            dp_scores: dict = {}
+            if args.strip_non_decision_thought:
+                # 回溯决策点检测 + 信号2打分，非决策点剥回纯 Action（见
+                # thought_consistency.py 顶部注释）。剥离后再切窗，保证窗口
+                # 内的 thought 密度与人工标注训练分布（12.4%）一致。
+                responses, dp_scores = strip_and_score(responses)
+                n_dpts_total += len(dp_scores)
+                for s in dp_scores.values():
+                    if s is not None:
+                        n_dpts_scored += 1
+                        score_sum += s
+
             # 窗口继承整个 episode 的奖励与组标签——切窗只为绕开序列长度限制，
             # 不改变 GRPO 的信度分配粒度（仍是 episode 级，见设计文档）
             for wstart, wframes, wresponses in windows_from_episode(
@@ -165,6 +189,13 @@ def main():
                                       system_prompt, window_start=wstart))
                 rewards.append(episode_reward)
                 groups.append(task_dir)
+                if args.strip_non_decision_thought:
+                    # 该窗口内所有决策点的信号2打分取均值；没有可判定分数
+                    # （窗口内无决策点，或决策点的 thought 全部查不出意图关键词）
+                    # 时给中性值 1.0——不影响、也不奖励（对应"查不出来不打分"）
+                    in_window = [dp_scores[i] for i in range(wstart, wstart + len(wresponses))
+                                if i in dp_scores and dp_scores[i] is not None]
+                    thought_factors.append(sum(in_window) / len(in_window) if in_window else 1.0)
 
     tbl = pa.Table.from_pylist(rows)
     pq.write_table(tbl, args.out, row_group_size=64)
@@ -175,6 +206,13 @@ def main():
                         zip(groups, [row["id"] for row in rows])))
     print(f"批次: {len(rows)} 窗口样本（来自 ~{n_episodes} episodes）| "
           f"窗口级成功率 {100*r.mean():.1f}% | 任务数 {len(set(groups))}")
+    if args.strip_non_decision_thought:
+        mean_score = score_sum / n_dpts_scored if n_dpts_scored else float("nan")
+        print(f"[bootstrap] 决策点 {n_dpts_total} 个，信号2可判定 {n_dpts_scored} "
+              f"个（{100*n_dpts_scored/max(n_dpts_total,1):.1f}%），可判定均分 "
+              f"{mean_score:.3f}")
+        if args.thought_signal:
+            np.save(args.thought_signal, np.array(thought_factors, dtype=np.float64))
 
 
 if __name__ == "__main__":
