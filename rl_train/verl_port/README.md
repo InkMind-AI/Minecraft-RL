@@ -2,17 +2,28 @@
 
 > 来源：CrossAgent 项目（2025-09）的 verl fork，随 CrossAgent 整体删除而抢救至此。
 > git 历史中完整原件仍在（删除前最后一个 commit）。移植目标：**上游 verl**
->（volcengine/verl 最新版）——本目录文件是待移植素材，不能直接 import
->（仍带 fork 的 `verl.` 前缀依赖）。
+>（verl-project/verl，23.6k★，现为 verl-project 组织维护）。
 
-## 资产清单
+## ⚠ 09-23 移植评估结论（实测 diff 后更新，改变下列资产的定位）
 
-| 目录/文件 | 内容 | 移植要点 |
+对比上游 `verl/models/transformers/qwen3_5.py`（661 行）与抢救版（127 行）：
+
+| 资产 | 上游现状 | 移植结论 |
 |---|---|---|
-| `model_adapter/qwen3_5.py`（127 行） | **Qwen3.5 hybrid 模型 verl 适配器**：Gated-DeltaNet 线性注意力 × full-attn 混合架构的 `forward_for_ppo` monkey patch，含 log_probs/entropy 输出、`apply_monkey_patch` 注册 | 我们模型（qwen35-9b-nf2 族）在 verl 里跑起来的关键。Ulysses SP 不支持（会显式报错）——FSDP 路径 |
-| `model_adapter/test_qwen3_5_adapter.py` | 适配器结构冒烟测试：tiny 随机初始化模型 + 伪造多模态输入，验证 hybrid 层前向产出 log_probs/entropy 形状 | **本地可跑（CPU）**，是移植后的第一个验收步骤 |
-| `env_minecraft/minecraft/`（3 文件） | Malmo 环境的 verl env 集成（envs.py + projection.py 动作投影） | 需对接我们当前 eval harness 的 Malmo 部署方式（MineStudio/minestudio 路径，见 envs.py 引用） |
-| `gigpo/core_gigpo.py`（303 行） | **GiGPO**：组内嵌套组优势——episode 级 + step 级双层分组，step-level 组按观测哈希聚合 | 正中我们"episode 稀疏奖励下信度分配"软肋；是 EM 自举信号4（局部进展塑形）的 principled 替代 |
+| **qwen3_5 适配器** | ✅ **已被上游大幅超越**：packed sequence（remove-padding）、fla chunked Gated-DeltaNet 前向（`_packed_chunk_gated_delta_rule`——正是我们 test3-10 踩坑的内核路径）、多模态 embed、fused kernel 后端选择 | **抢救版作废，直接用上游**——模型后端（原以为最难的部分）移植成本归零 |
+| minecraft env 包 | 上游无 Minecraft；社区 **verl-agent** 项目是 gym 风格 env + GiGPO 的正式新家 | 仍需移植，本目录 envs.py 作参考 |
+| GiGPO core | ✅ verl-agent 项目收录 | 从 verl-agent 取，抢救版作算法阅读材料 |
+| mc-mix_coa 参考配置 | 无对应 | 仍有用（超参起点） |
+
+## 资产清单（保留作参考）
+
+| 目录/文件 | 内容 |
+|---|---|
+| `model_adapter/qwen3_5.py`（127 行，**已被上游超越**） | fork 时代的 Qwen3.5 hybrid 适配器：Gated-DeltaNet × full-attn 的 `forward_for_ppo`。上游版本功能是其超集 |
+| `model_adapter/test_qwen3_5_adapter.py` | 结构冒烟测试（tiny 模型 + 伪造多模态输入）——验收思路仍可复用 |
+| `env_minecraft/minecraft/`（3 文件） | Malmo 的 verl env 集成（envs.py + projection.py 动作投影） |
+| `gigpo/core_gigpo.py`（303 行，**上游已有**） | GiGPO：episode 级 + step 级嵌套组优势 |
+| `ref_configs/mc-mix_coa/*.sh` | 当年 Minecraft GRPO 超参参考（lr 5e-6 / KL 0.01 low_var_kl / TP=2 / gpu_mem_util 0.4 等） |
 | `ref_configs/mc-mix_coa/*.sh` | 当年 Minecraft GRPO 的完整超参参考（qwen2-vl-7b 时代：lr 5e-6、KL 0.01 low_var_kl、dynamic_rollouts、TP=2、gpu_mem_util 0.4 等） | 迁移时换模型路径/环境配置，超参作起点 |
 
 ## 移植时的已知坑（从旧脚本和我们的经验推断）
@@ -21,13 +32,12 @@
 2. **transformers 版本**：`Qwen3_5ForConditionalGeneration` 需较新 transformers；fork 的 requirements 与上游 verl 的版本约束需对齐
 3. **旧脚本的集群路径**（`/share/hkc/...`、`MC-verl-agent/...`）全部失效，参考时只看超参
 
-## 移植步骤（Phase 1 计划）
+## 移植步骤（Phase 1 计划，按上游评估结论更新）
 
 ```
-① pip install 上游 verl → 版本/API 摸底
-② qwen3_5.py 移植到上游的 verl/models/transformers/ 注册路径 → 跑冒烟测试
-③ minecraft env 对接我们的 Malmo（minestudio）部署
-④ reward 函数：帧数 < 180 = 1（沿用现有 SUCCESS_MAX_FRAMES 判定）
-⑤ 首个 GRPO：从 cot-pilot-v2/checkpoint-520 起步（与自研线同起点，可对照）
-⑥ GiGPO 替换 GRPO（解决信度分配）
+① pip install 上游 verl → 验证 qwen3_5 适配器加载我们的 checkpoint（真模型冒烟，集群跑）
+② minecraft env：参考本目录 envs.py + verl-agent 的 env 接口，对接我们的 Malmo 部署
+③ reward 函数：帧数 < 180 = 1（沿用现有 SUCCESS_MAX_FRAMES 判定）
+④ 首个 GRPO：从 cot-pilot-v2/checkpoint-520 起步（与自研线同起点，可对照）
+⑤ GiGPO 替换 GRPO（从 verl-agent 取，解决信度分配）
 ```
