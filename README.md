@@ -7,7 +7,7 @@ frames and emit structured actions (and, in the full-trajectory stage, multi-ste
 chain-of-thought). It is built on top of the
 [OpenHA](https://github.com/CraftJarvis/OpenHA) infrastructure: the Minecraft
 environment, agent rollout, and grounding (SAM2) support come from the vendored
-`openagents/`, `CrossAgent/`, and `external/` directories, while our primary
+`openagents/` and `external/` directories, while our primary
 contribution is the `trl_sft/` training pipeline described below.
 
 > The original OpenHA documentation is preserved at [`README_OpenHA.md`](./README_OpenHA.md)
@@ -23,7 +23,7 @@ contribution is the `trl_sft/` training pipeline described below.
 | `openagents/` | Minecraft agent framework, vLLM rollout client, system prompts. | Vendored (OpenHA) |
 | `examples/` | Rollout / evaluation scripts (e.g. `rollout_openha.py`). | Vendored (OpenHA) |
 | `scripts/` | Launch helpers for OpenHA inference. | Vendored (OpenHA) |
-| `CrossAgent/` | Cross-level reinforcement-learning training code. | Vendored (OpenHA) |
+| `rl_train/` | RL training (self-built GRPO loop in `trl_sft/` + verl port assets for the upstream-verl migration). | Ours |
 | `external/` | External dependencies (modified SAM2 for grounding). | Vendored (OpenHA) |
 
 ---

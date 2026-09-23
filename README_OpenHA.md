@@ -20,6 +20,7 @@
 
 ## ⭐️ Updates
 - **[2025.12] Released our paper: "[Training One Model to Master Cross-Level Agentic Actions via Reinforcement Learning](https://arxiv.org/abs/2512.09706)". We also released the related code in the `CrossAgent` folder.**
+  （09-23 注：`CrossAgent/` 已从本仓库清理删除以聚焦当前 Minecraft CoT/RL 研究，原代码在 git 历史与论文官方仓库可获取；其中对当前工作有用的 verl 集成资产已抢救至 `rl_train/verl_port/`）
 - **[2025.09] Released our paper: "[OpenHA: A Series of Open-Source Hierarchical Agentic Models in Minecraft](https://arxiv.org/abs/2509.13347)".**
 - **[2025.09] Released the codebase.**
 

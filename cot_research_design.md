@@ -30,7 +30,9 @@
 
 ### 路线 C：自举迭代（RFT/STaR 式，后期做）
 - 当前 CoT 模型 rollout easy 任务 → 保留成功轨迹的推理 → 回炉训练
-- STRL 基建（CrossAgent/STRL 的 coa RL 管线）可直接复用，这是第二阶段（RL）的事
+- ~~STRL 基建（CrossAgent/STRL 的 coa RL 管线）可直接复用，这是第二阶段（RL）的事~~
+  （09-23 更新：CrossAgent 已随旧项目清理删除；RL 走自研 GRPO 管线（trl_sft/，已跑通），
+  正在迁移到上游 verl——抢救资产与计划见 rl_train/verl_port/README.md）
 
 ### 推荐配比
 Phase 1 用 **A+B 混合**（A 保底 50% 保忠实，B 加 50% 提多样性）；先在 1-2k 条轨迹上试产 + 人工抽检 50 条（合格线：推理与状态一致率 >90%、与动作一致率 >95%），再全量。
