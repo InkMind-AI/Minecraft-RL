@@ -1,6 +1,5 @@
 # CoT 标注方案：设计、实验与结论
 
-> 更新至 2026-09-22 | 状态：**v2 配方定稿**，D 方案曲线未见顶（可补跑 e6-e8）
 
 ## 1. 标注链路总览
 
@@ -78,23 +77,3 @@ D:   21.3 → 21.9 → 27.3 → 27.6 → 28.8   （未见顶，e5 是最后存�
 
 **D 方案的遗留悬念**：e5=28.8% 仍在上行，补跑 e6-e8 是低成本可选实验；若反超则切换。
 
-## 6. 标注器工程要点（可复用）
-
-- **可插拔三后端**：stub / openai（兼容网关）/ gemini，环境变量切换零改码
-- **稳健性**：429 指数退避（10s→320s × 8）、400 渐进降级（先摘 response_format 再摘 temperature）、JSON 容错解析
-- **断点续跑**：done_ids.txt + 50 条原子 chunk + 每 500 条增量落盘
-- **事故教训**：Venus 配额耗尽时 API 静默失败 → 存 4,805 行无 thought 空壳。**失败率超阈值必须硬报错**（修复项）
-- 速率参考：gemini-3.8-flash ~24 轨迹/分钟，1.6k 条 Combat 定向批 21 分钟跑完
-
-## 7. 相关文件索引
-
-| 模块 | 路径 |
-|---|---|
-| 决策点检测 | `cot_annotation/decision_points.py` |
-| Prompt（V2 版） | `cot_annotation/prompts.py` |
-| 标注器 | `cot_annotation/annotator.py` |
-| 管线（含黑名单） | `cot_annotation/pipeline.py` |
-| Combat 定向批 | `cot_annotation/combat_batch.py` |
-| 训练集构建 | `~/cot_build/build_dataset.py` / `build_v2.py` |
-| 训练脚本（参数化） | `trl_sft/train_stage3.sh` |
-| 实验全记录 | `experiment_summary_20260905.md` §7 |
