@@ -1,6 +1,6 @@
 # verl-agent 迁移：源码接入为我们的 RL 训练实现
 
-> 方式（09-24 定稿）：**源码 vendor verl-agent**（不是 pip 依赖，不是裸 verl）。
+> **源码 vendor verl-agent**（不是 pip 依赖，不是裸 verl）。
 > verl-agent = 完整 verl + agent_system 多轮环境框架 + GiGPO（NeurIPS 2025 官方
 > 实现）——多轮 env 框架和 GiGPO 现成，正好覆盖我们最重的两步工作。
 > 前置结论（09-23/24 实测查证）：上游 verl 已内置 qwen3_5 适配器（模型后端零
@@ -14,10 +14,6 @@
 | vendor 裸 verl | 可行但多轮 env 框架要自搭、GiGPO 要另抄 |
 | **vendor verl-agent**（选定） | ✅ 多轮 agent loop 现成（Malmo 需要的正是它）、GiGPO 现成、内嵌完整 verl；koala 经 S3 sync 零安装 |
 
-**源码 vendor 的技术依据**：部署走"本地工作树 → S3 代码桶 → koala 挂载"，
-文件物理存在才可靠（`external/SAM2` submodule 未初始化时 S3 上是空目录，
-submodule 方案已实测否决）。仓库先例：`openagents/` 就是 17MB 纯源码 vendor。
-
 ## 目录规划
 
 ```
@@ -30,7 +26,7 @@ rl_train/
 
 ## 六步迁移（verl-agent 基座版）
 
-### 第 1 步：vendor 源码 + 环境验证（1 天，风险最大，最先做）
+### 第 1 步：vendor 源码 + 环境验证
 
 ```
 ① 浅克隆 verl-agent → 拷入 rl_train/verl_agent/（记录 commit）
@@ -44,10 +40,9 @@ rl_train/
 ```
 
 **风险点**：FSDP × fla 线性注意力内核从未在 koala 验证（自研线是 DeepSpeed
-ZeRO-2）。源码 vendor 的优势在此：有问题直接改 vendor 内文件。不通则试 verl
-的 DeepSpeed 后端，再不行退回自研线（止损 1 天）。
+ZeRO-2）。不通则试 verl 的 DeepSpeed 后端，再不行退回自研线（止损 1 天）。
 
-### 第 2 步：Minecraft 环境接入（1-2 天，工作量因 verl-agent 大幅缩水）
+### 第 2 步：Minecraft 环境接入
 
 ```
 直接把 verl_port/env_minecraft/minecraft/ 放进
@@ -56,7 +51,7 @@ verl_agent/agent_system/environments/env_package/（布局同源，当年就是�
 多轮循环、obs/step/reward 管线全部复用 verl-agent 现成框架
 ```
 
-### 第 3 步：Reward 函数（半天）
+### 第 3 步：Reward 函数
 
 ```python
 def minecraft_reward(frames_count, ...):
@@ -64,7 +59,7 @@ def minecraft_reward(frames_count, ...):
 ```
 注册为 custom reward。首版零 shaping（G=8 组内相对比较已含信号）。
 
-### 第 4 步：首个 GRPO 配置（1-2 天）
+### 第 4 步：首个 GRPO 配置
 
 | 配置项 | 值 | 依据 |
 |---|---|---|
@@ -74,14 +69,14 @@ def minecraft_reward(frames_count, ...):
 | LR | 5e-6 起步 | mc-mix_coa 参考值 |
 | thought 触发 | **首版自由触发，不强制** | iteration-1 实测 FORCE_THOUGHT 致 29.2%→5.4%；概率触发留作后续实验 |
 
-### 第 5 步：对照验证与切换决策（1 天）
+### 第 5 步：对照验证与切换决策
 
 - verl 产物 vs 自研线同起点产物，同协议评测（easy-ng × h29 × 3 rollouts）
 - 吞吐对比（verl-agent rollout vs HTTP rollout）
 - 通过标准：成绩不劣于自研线 + 吞吐 ≥3× → 主线切换；自研 RL 文件（trl_sft/ 下
   5 个）归档保留
 
-### 第 6 步：GiGPO 升级（一天，verl-agent 基座下几乎免费）
+### 第 6 步：GiGPO 升级
 
 配置切换即用（`examples/gigpo_trainer/` 现成脚本 + mc-mix_coa 超参），解决
 "episode 稀疏奖励下信度分配"——自研线 signal-4 / 局部进展塑形想解决的同一问题。
@@ -106,4 +101,11 @@ def minecraft_reward(frames_count, ...):
 
 ## VERL_AGENT_COMMIT
 
-（vendor 时填：`________`）
+`20bd331`（2026-09-24 vendor，96MB → 3.3MB 最小快照）。vendor 内的本地补丁（相对上游 verl-agent）：
+
+1. `verl/models/transformers/qwen3_5.py` —— 从上游 verl 拷入（661 行新版，含 packed seq / fla chunked Gated-DeltaNet / 多模态 embed）
+2. `verl/models/transformers/monkey_patch.py` —— 移植 qwen3_5 两处注册分支（site-1 backend 选择 + site-2 完整 monkey patch；Ulysses SP 改为显式拒绝——比上游静默 patch 更安全）
+3. `agent_system/environments/env_package/minecraft/` —— CrossAgent 抢救 env（verl_port 迁入）
+4. `agent_system/environments/env_manager.py` —— 新增 minecraft elif 分支（Manager 暂复用 Webshop 实现，info/reward 契约适配是第 2 步工作项）
+
+冒烟脚本：`rl_train/verl_jobs/smoke_step1.py`（A import / B tiny 混合模型+适配器 / C 真实 checkpoint-520 原生前向+生成+patch 后 log_probs）
