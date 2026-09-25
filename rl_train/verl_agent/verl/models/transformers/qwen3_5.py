@@ -350,7 +350,12 @@ def qwen3_5_decoder_layer_forward(
 
     hidden_states = self.input_layernorm(hidden_states)
 
-    if self.layer_type == "linear_attention":
+    # 09-25 兼容补丁：上游 verl 适配器写的是 self.layer_type，但 transformers
+    # 5.15.0 的 Qwen3_5DecoderLayer 用的是 self.block_type（koala sft env 实测
+    # AttributeError 后定位）。两个名字都兜住。
+    _block_type = getattr(self, "layer_type", None) or getattr(self, "block_type", None)
+
+    if _block_type == "linear_attention":
         hidden_states = self.linear_attn(
             hidden_states=hidden_states,
             cache_params=past_key_values,
@@ -358,7 +363,7 @@ def qwen3_5_decoder_layer_forward(
             cu_seqlens=cu_seqlens,
             cu_seqlens_cpu=cu_seqlens_cpu,
         )
-    elif self.layer_type == "full_attention":
+    elif _block_type == "full_attention":
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -583,7 +588,13 @@ def forward_with_torch_backend(
     else:
         raise RuntimeError("To use forward_with_torch_backend, either labels or input_ids must be provided.")
 
-    fused_linear_for_ppo = FusedLinearForPPO(impl_backend=getattr(self, "_verl_fused_kernels_backend", "torch"))
+    # 09-25 兼容：verl-agent 内嵌版 FusedLinearForPPO 只有 chunk_size 参数，
+    # impl_backend 是上游新版 API——TypeError 时回退旧签名（性能优化差异，
+    # 不影响数学正确性）
+    try:
+        fused_linear_for_ppo = FusedLinearForPPO(impl_backend=getattr(self, "_verl_fused_kernels_backend", "torch"))
+    except TypeError:
+        fused_linear_for_ppo = FusedLinearForPPO()
     vocab_weights = self.lm_head.weight
     if isinstance(vocab_weights, DTensor):
         vocab_weights = vocab_weights.full_tensor()

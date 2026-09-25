@@ -92,7 +92,8 @@ def check_b_adapter_tiny():
         out = model(input_ids=input_ids, attention_mask=attention_mask,
                     pixel_values=pixel_values, image_grid_thw=image_grid_thw,
                     mm_token_type_ids=mm_token_type_ids,
-                    position_ids=None, temperature=1.0)
+                    position_ids=None, temperature=1.0,
+                    use_cache=False)  # RL 前向无需 KV cache；且 5.15 的 DynamicCache 无 conv_states 会炸
     if hasattr(out, "log_probs") and out.log_probs is not None:
         assert out.log_probs.shape == (1, input_ids.shape[1]), out.log_probs.shape
         assert torch.isfinite(out.log_probs).all(), "log_probs NaN/Inf"

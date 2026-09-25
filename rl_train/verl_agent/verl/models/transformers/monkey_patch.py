@@ -383,51 +383,37 @@ def apply_monkey_patch(
             patch_vlm_for_ulysses_input_slicing(Qwen3VLMoeTextModel)
 
     elif model.config.model_type in ["qwen3_5", "qwen3_5_moe"]:
-        # 09-24 从上游 verl 移植：Qwen3.5 hybrid（Gated-DeltaNet 线性注意力 × full-attn）
-        # 的完整 monkey patch——qwen3_5.py 也是同日从上游 verl 拷入的新版（661 行，
-        # 含 packed seq / fla chunked Gated-DeltaNet 前向 / 多模态 embed / fused kernel
-        # 后端选择）。移植位点对照上游 verl monkey_patch.py 的同名分支。
-        # Step 1: patch model to support image-text mixed data
+        # 09-24 从上游 verl 移植；09-25 按 transformers 5.15 实测大幅缩减：
+        # 5.15 的原生 Qwen3_5Model/DecoderLayer/GatedDeltaNet 已内置多模态
+        # embed、fla 内核（causal_conv1d_fn / torch_chunk_gated_delta_rule）、
+        # packed sequence（cu_seq_lens_q）——上游适配器对这些层的自定义前向
+        # 属于旧版 transformers 时代的补丁，在 5.15 上冗余且 API 漂移三连
+        # （layer_type→block_type、conv_states、causal_conv1d_fn 属性）。
+        # 因此只 patch verl 真正需要的 ForConditionalGeneration.forward
+        # （产出 log_probs/entropy 的 PPO 前向），内部全部走原生实现——
+        # 与我们 SFT 训练/vLLM 推理一直在用的已知好路径完全一致。
         from transformers.models.qwen3_5.modeling_qwen3_5 import (
-            Qwen3_5DecoderLayer,
             Qwen3_5ForConditionalGeneration,
-            Qwen3_5GatedDeltaNet,
-            Qwen3_5Model,
-            Qwen3_5TextModel,
             Qwen3_5VisionModel,
         )
         from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
-            Qwen3_5MoeDecoderLayer,
             Qwen3_5MoeForConditionalGeneration,
-            Qwen3_5MoeGatedDeltaNet,
-            Qwen3_5MoeModel,
-            Qwen3_5MoeTextModel,
             Qwen3_5MoeVisionModel,
         )
 
         from verl.models.transformers.qwen3_5 import (
             fast_pos_embed_interpolate,
             forward_with_normal_backend,
-            qwen3_5_base_forward,
-            qwen3_5_decoder_layer_forward,
-            qwen3_5_gated_delta_net_forward,
         )
 
-        Qwen3_5Model.forward = qwen3_5_base_forward
-        Qwen3_5MoeModel.forward = qwen3_5_base_forward
-        Qwen3_5DecoderLayer.forward = qwen3_5_decoder_layer_forward
-        Qwen3_5MoeDecoderLayer.forward = qwen3_5_decoder_layer_forward
-        Qwen3_5GatedDeltaNet.forward = qwen3_5_gated_delta_net_forward
-        Qwen3_5MoeGatedDeltaNet.forward = qwen3_5_gated_delta_net_forward
         Qwen3_5ForConditionalGeneration.forward = forward_with_normal_backend
         Qwen3_5MoeForConditionalGeneration.forward = forward_with_normal_backend
-        print(f"Monkey patch {model.__class__.__name__} model forward")
+        print(f"Monkey patch {model.__class__.__name__} forward (PPO output; native sublayers)")
 
-        # Step 2: patch vision model to fix fsdp2 cpu_offload bug.
+        # FSDP2 cpu_offload 修复补丁（vision 侧 helper，属性赋值无副作用）
         Qwen3_5VisionModel.fast_pos_embed_interpolate = fast_pos_embed_interpolate
         Qwen3_5MoeVisionModel.fast_pos_embed_interpolate = fast_pos_embed_interpolate
-        # Ulysses SP 对本模型族不支持（线性注意力的因果递归会被 SP 破坏，
-        # 强制单卡序列并行——上游 qwen3_5.py 的测试脚本会显式验证这一点）
+        # Ulysses SP 对本模型族不支持（线性注意力的因果递归会被 SP 破坏）
         if ulysses_sp_size > 1:
             raise NotImplementedError(
                 "Ulysses sequence parallelism is not supported for qwen3_5 "
