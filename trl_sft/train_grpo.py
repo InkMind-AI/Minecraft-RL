@@ -39,6 +39,37 @@ import numpy as np  # noqa: E402
 # tensor 工具函数能在无 deepspeed 的环境（如本地 CPU 冒烟测试）独立导入验证。
 
 
+def _save_engine_checkpoint(engine, processor, model, save_dir: str):
+    """保存可直接被 vLLM/HF 加载的完整 checkpoint。
+
+    ⚠ 09-25 实测踩坑（iter1 评测两连败的根因，勿改回去）：
+    ① engine.save_16bit_model(dir, "model.safetensors") 存的实为 **torch zip
+      格式**（首字节 PK 魔数），只是文件名叫 .safetensors——vLLM 按 safetensors
+      解析报 "header too large"。必须 torch.load 后用 safetensors 库重序列化。
+    ② save_16bit_model 不存 config.json/generation_config.json——vLLM 引擎
+      初始化直接失败。此处从 model.config 一并补齐。
+    """
+    import torch
+    from safetensors.torch import save_file as st_save_file
+    os.makedirs(save_dir, exist_ok=True)
+    engine.save_16bit_model(save_dir, "_raw_weights.bin")
+    if engine.global_rank != 0:
+        return
+    sd = torch.load(os.path.join(save_dir, "_raw_weights.bin"),
+                    map_location="cpu", weights_only=True)
+    sd = {(k[len("module."):] if k.startswith("module.") else k): v.contiguous()
+          for k, v in sd.items()}
+    st_save_file(sd, os.path.join(save_dir, "model.safetensors"),
+                 metadata={"format": "pt"})
+    os.remove(os.path.join(save_dir, "_raw_weights.bin"))
+    if hasattr(model, "generation_config") and model.generation_config is not None:
+        model.generation_config.save_pretrained(save_dir)
+    if hasattr(model, "config") and model.config is not None:
+        model.config.save_pretrained(save_dir)
+    if processor:
+        processor.save_pretrained(save_dir)
+
+
 def token_logprobs_from_logits(logits: torch.Tensor, labels: torch.Tensor,
                                chunk: int = 1024) -> tuple:
     """逐 chunk 计算 label 位置的 logprob。
@@ -222,17 +253,14 @@ def main():
                       f"pg={pg_val:.4f} |adv|={adv.abs().mean().item():.3f}", flush=True)
             if update % args.save_steps == 0:
                 save_dir = os.path.join(args.output_dir, f"checkpoint-{update}")
-                engine.save_16bit_model(save_dir, "model.safetensors")
-                if processor:
-                    processor.save_pretrained(save_dir)
+                _save_engine_checkpoint(engine, processor, model, save_dir)
                 if args.s3_output_dir and engine.global_rank == 0:
                     os.system(f"aws s3 sync {save_dir}/ "
                               f"{args.s3_output_dir}/checkpoint-{update}/ --only-show-errors")
                 print(f"[rl] 已存 checkpoint-{update}", flush=True)
 
     final_dir = os.path.join(args.output_dir, "final")
-    engine.save_16bit_model(final_dir, "model.safetensors")
-    processor.save_pretrained(final_dir)
+    _save_engine_checkpoint(engine, processor, model, final_dir)
     if args.s3_output_dir and engine.global_rank == 0:
         os.system(f"aws s3 sync {final_dir}/ {args.s3_output_dir}/final/ --only-show-errors")
     print("[rl] 训练完成", flush=True)

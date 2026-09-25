@@ -287,13 +287,19 @@ def apply_monkey_patch(
     )
 
     if is_trl_available():
-        from trl import AutoModelForCausalLMWithValueHead  # type: ignore
+        # 09-25 修复：新版 trl 已移除 AutoModelForCausalLMWithValueHead——
+        # is_trl_available() 只验包可导入，不验类存在。此补丁仅为旧版 trl 的
+        # state_dict 兼容服务，类缺失时跳过无害（koala sft env 实测触发）。
+        try:
+            from trl import AutoModelForCausalLMWithValueHead  # type: ignore
 
-        def state_dict(self, *args, **kwargs):
-            return torch.nn.Module.state_dict(self, *args, **kwargs)
+            def state_dict(self, *args, **kwargs):
+                return torch.nn.Module.state_dict(self, *args, **kwargs)
 
-        AutoModelForCausalLMWithValueHead.state_dict = state_dict
-        print("Monkey patch state_dict in AutoModelForCausalLMWithValueHead. ")
+            AutoModelForCausalLMWithValueHead.state_dict = state_dict
+            print("Monkey patch state_dict in AutoModelForCausalLMWithValueHead. ")
+        except ImportError:
+            pass
 
     # TODO: VLM models only, unify monkey patch to LLM models.
     if model.config.model_type in ["qwen2_5_vl", "qwen2_vl"]:

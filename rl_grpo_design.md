@@ -82,7 +82,7 @@ torchrun --nproc_per_node=8 train_grpo.py \
 
 ---
 
-## 2. 调试过程（test3-10：四层洋葱排障史，最终全通过）
+## 2. 调试过程
 
 | 测试 | 配置 | 结果 | 根因与教训 |
 |---|---|---|---|
@@ -90,10 +90,10 @@ torchrun --nproc_per_node=8 train_grpo.py \
 | test4 | 2 卡 ZeRO2 + sdpa | ❌ OOM（首次前向） | 单/双卡下 ZeRO2 静态占用 ~63GB，激活预算不足 |
 | test5 | 2 卡 + 优化器 CPU offload + sdpa | ❌ OOM | offload 后静态仅 ~27GB 仍爆——当时误判为 sdpa materialize O(N²) 注意力矩阵 |
 | test6 | 2 卡 + flash-attn | ❌ OOM | flash-attn 确认装上（2.7.4.post1）仍爆 135GB——排除注意力实现，指向代码层 |
-| test7 | **8 卡 + flash-attn（=生产配置）** | ❌ OOM 134GB | 决定性一击：与生产 SFT 完全相同配置也爆 → 问题在 train_grpo.py 自身。归因 log_softmax+gather materialize [chunk,V] fp32 中间量（~+35GB），改 fused cross_entropy |
+| test7 | **8 卡 + flash-attn（=生产配置）** | ❌ OOM 134GB | 与生产 SFT 完全相同配置也爆 → 问题在 train_grpo.py 自身。归因 log_softmax+gather materialize [chunk,V] fp32 中间量（~+35GB），改 fused cross_entropy |
 | test8 | 8 卡 + fused CE + offload | ❌ OOM 135GB | CE 重构（真优化但非主犯）无效——135GB 与 test7 一字不差，说明大头另有其人 |
 | test9 | 8 卡 + non-reentrant checkpoint + enable_input_require_grads | ❌ OOM 135GB | 修复 reentrant checkpoint 静默失效（冻结 ViT 后输入链无 grad）——仍无效，但排除了第三层 |
-| **test10** | 8 卡 + **`LINEAR_ATTN_KERNELS=1`**（装 fla/causal-conv1d） | ✅ **通过** | **真凶**：模型带线性注意力层，fla 内核从未安装，旧版 fla 在 Triton 不兼容时静默 fallback 到纯 PyTorch naive 实现（O(N²) 中间量 ≈130GB，与卡数无关——解释了 2 卡/8 卡内存一字不差的所有"反常"） |
+| **test10** | 8 卡 + **`LINEAR_ATTN_KERNELS=1`**（装 fla/causal-conv1d） | ✅ **通过** | 模型带线性注意力层，fla 内核从未安装，旧版 fla 在 Triton 不兼容时静默 fallback 到纯 PyTorch naive 实现（O(N²) 中间量 ≈130GB，与卡数无关——解释了 2 卡/8 卡内存一字不差的所有"反常"） |
 
 ### 调试结论
 
