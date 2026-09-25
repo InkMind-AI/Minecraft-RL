@@ -125,17 +125,19 @@ def check_c_real_checkpoint(model_path: str):
         return_dict=True, return_tensors="pt")
     inputs = {k: (v.cuda() if torch.is_tensor(v) else v) for k, v in inputs.items()}
 
-    # ① 原生 HF 前向 + 生成（未 patch）
+    # ① 原生 HF 前向（未 patch）——生成路径跳过：processor 产出的多模态键
+    # （mm_token_type_ids 等）与 generate() 的 kwargs 白名单不兼容，属脚本层
+    # 细节，与 verl 适配器无关；RL 训练只走 forward，这里验证 forward 即可。
     with torch.no_grad():
-        gen = model.generate(**inputs, max_new_tokens=8, do_sample=False)
-    txt = processor.decode(gen[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-    print(f"[OK] 原生前向+生成: {txt[:80]!r}", flush=True)
+        native_out = model(**inputs, use_cache=False)
+    assert torch.isfinite(native_out.logits).all(), "native logits NaN/Inf"
+    print(f"[OK] 原生前向: logits{tuple(native_out.logits.shape)}", flush=True)
 
     # ② patch 后带 labels 前向（log_probs 路径——训练时的真实调用形态）
     apply_monkey_patch(model, use_remove_padding=False,
                        use_fused_kernels=True, fused_kernels_backend="torch")
     with torch.no_grad():
-        out = model(**inputs, temperature=1.0)
+        out = model(**inputs, temperature=1.0, use_cache=False)
     if hasattr(out, "log_probs") and out.log_probs is not None:
         assert torch.isfinite(out.log_probs).all(), "log_probs NaN/Inf"
         print(f"[OK] patch 后前向: log_probs{tuple(out.log_probs.shape)}", flush=True)
