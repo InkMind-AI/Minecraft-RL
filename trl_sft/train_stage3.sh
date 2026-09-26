@@ -57,6 +57,9 @@ NUM_EPOCHS="${NUM_EPOCHS:-1}"
 SAVE_STEPS="${SAVE_STEPS:-200}"
 WARMUP_STEPS="${WARMUP_STEPS:-102}"
 SHUFFLE="${SHUFFLE:-0}"
+# 方案 T（思维退火）：逗号分隔的每-epoch Thought 保留概率，例 "1.0,1.0,0.5,0.5,0.0"。
+# 留空 = 机制完全关闭（默认，行为与历史训练逐字一致）。见 train_sft.py 的同名参数。
+THOUGHT_KEEP_SCHEDULE="${THOUGHT_KEEP_SCHEDULE:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
@@ -144,4 +147,5 @@ torchrun --nproc_per_node="$NPROC" --tee 3 train_sft.py \
     --deepspeed ds_zero2_no_offload.json \
     --save_steps "$SAVE_STEPS" \
     --logging_steps 10 \
+    $( [ -n "$THOUGHT_KEEP_SCHEDULE" ] && echo --thought_keep_schedule "$THOUGHT_KEEP_SCHEDULE" ) \
     $( [ "$SHUFFLE" = "1" ] && echo --shuffle )

@@ -12,7 +12,7 @@ from __future__ import annotations
 import io
 import logging
 import random
-from typing import Dict, List, Set
+from typing import Dict, List, Optional, Sequence, Set
 
 import torch
 from PIL import Image
@@ -207,9 +207,32 @@ def _assistant_turn_text(message: Dict) -> str:
     return " ".join(parts).strip()
 
 
+def _strip_thought_from_text(text: str) -> Optional[str]:
+    """Drop a leading ``Thought: ...`` block, keeping the ``Action: ...`` remainder.
+
+    Returns None when `text` is not a thought-bearing assistant turn (so callers can
+    tell "nothing to strip" from "stripped"). Mirrors `cot_build/build_v2.py`'s
+    `clean_thought_full` shape -- thought line(s) first, then the Action line -- but
+    strips unconditionally instead of only on blacklist hits. Cutting at the first
+    ``\\nAction:`` rather than the first newline also tolerates a multi-line thought.
+    """
+    if not text.startswith("Thought:"):
+        return None
+    idx = text.find("\nAction:")
+    if idx < 0:
+        return None
+    return text[idx + 1:]
+
+
 class MultiStepVLMCollator(DataCollatorForVisionLanguageModeling):
     """TRL's VLM collator, but only assistant turns contribute to the loss, with
     VeOmni's "focal" down-weighting of consecutively-repeated actions.
+
+    Also implements **thought annealing** (方案 T, 09-26) via `thought_keep_schedule`:
+    a per-epoch keep probability for `Thought:` blocks, so CoT text can act as a
+    *training scaffold* that is progressively removed, leaving a final model whose
+    inference path is byte-identical to a never-had-thought (ctrl) policy. See
+    `set_epoch` / `_anneal_thoughts`.
 
     The parent already injects images, renders the chat template, expands image tokens
     and pads; its `_collate_language_modeling` sets `labels = input_ids` (loss on every
@@ -250,12 +273,29 @@ class MultiStepVLMCollator(DataCollatorForVisionLanguageModeling):
     `random() > alpha` is never true) and restores the previous behaviour.
     """
 
-    def __init__(self, *args, focal_decay: float = 0.75, focal_seed: int = 0, **kwargs):
+    def __init__(self, *args, focal_decay: float = 0.75, focal_seed: int = 0,
+                 thought_keep_schedule: Optional[Sequence[float]] = None, **kwargs):
         super().__init__(*args, **kwargs)
         if not 0.0 <= focal_decay <= 1.0:
             raise ValueError(f"focal_decay must be in [0.0, 1.0], got {focal_decay}")
         self.focal_decay = focal_decay
         self._warned_empty_text = False
+        # ─── 方案 T：思维退火 ────────────────────────────────────────────────
+        # Per-epoch P(keep a Thought block). None disables the mechanism entirely
+        # (zero behaviour change). Index = completed-epoch count, clamped to the
+        # last entry, so a schedule shorter than num_train_epochs simply holds.
+        if thought_keep_schedule is not None:
+            bad = [p for p in thought_keep_schedule if not 0.0 <= float(p) <= 1.0]
+            if bad:
+                raise ValueError(f"thought_keep_schedule entries must be in [0,1], got {bad}")
+        self.thought_keep_schedule = (
+            [float(p) for p in thought_keep_schedule] if thought_keep_schedule else None)
+        self._thought_keep_p = 1.0
+        # Separate stream from `_focal_rng` so toggling annealing cannot shift the
+        # focal drop pattern (and vice versa) -- keeps the two ablations orthogonal.
+        self._thought_rng = random.Random(focal_seed + 9973)
+        self._anneal_seen = 0
+        self._anneal_stripped = 0
         # Dataset-level chat-template kwargs (Qwen3.x enable_thinking=False), resolved
         # from this collator's own processor -- injected per-example at collate time
         # instead of being stored as an Arrow-unstable per-row column. See
@@ -328,12 +368,84 @@ class MultiStepVLMCollator(DataCollatorForVisionLanguageModeling):
             dropped.discard(assistant_idx)
         return dropped
 
+    # ─── 方案 T：思维退火 ────────────────────────────────────────────────────
+    def set_epoch(self, epoch_idx: int) -> float:
+        """Point the annealer at `epoch_idx`'s keep probability; returns that p."""
+        if not self.thought_keep_schedule:
+            return 1.0
+        i = max(0, min(int(epoch_idx), len(self.thought_keep_schedule) - 1))
+        self._thought_keep_p = self.thought_keep_schedule[i]
+        return self._thought_keep_p
+
+    def pop_anneal_stats(self) -> Dict[str, int]:
+        """Drain the observed (seen, stripped) thought counters since the last call."""
+        stats = {"seen": self._anneal_seen, "stripped": self._anneal_stripped}
+        self._anneal_seen = 0
+        self._anneal_stripped = 0
+        return stats
+
+    def _anneal_thoughts(self, examples):
+        """Strip each `Thought:` block with probability `1 - keep_p` (per turn).
+
+        Clones the chat containers it edits: dataset rows MUST stay pristine, because
+        the schedule revisits the same rows at a different keep_p in later epochs (an
+        in-place strip at epoch 3 would make the thought unrecoverable and silently
+        turn the whole remaining run into the keep_p=0 arm).
+
+        Runs BEFORE `super().__call__`, so the focal repeat-detector and the label
+        masking both see the post-strip text -- i.e. a fully annealed epoch is
+        byte-identical to training on thought-free data, which is exactly the
+        property that bounds this arm's inference behaviour by ctrl's.
+        """
+        if not self.thought_keep_schedule or self._thought_keep_p >= 1.0:
+            return examples
+        keep_p = self._thought_keep_p
+        working_examples = []
+        for example in examples:
+            messages = example.get("messages")
+            if not isinstance(messages, list):
+                working_examples.append(example)
+                continue
+            cloned = _clone_conversation(messages)
+            for message in cloned:
+                if not isinstance(message, dict) or message.get("role") != "assistant":
+                    continue
+                content = message.get("content")
+                if isinstance(content, str):
+                    if content.startswith("Thought:"):
+                        self._anneal_seen += 1
+                        if self._thought_rng.random() >= keep_p:
+                            stripped = _strip_thought_from_text(content)
+                            if stripped is not None:
+                                message["content"] = stripped
+                                self._anneal_stripped += 1
+                    continue
+                if not isinstance(content, list):
+                    continue
+                for item in content:
+                    if not isinstance(item, dict) or item.get("type") != "text":
+                        continue
+                    text = item.get("text") or ""
+                    if not text.startswith("Thought:"):
+                        continue
+                    self._anneal_seen += 1
+                    if self._thought_rng.random() >= keep_p:
+                        stripped = _strip_thought_from_text(text)
+                        if stripped is not None:
+                            item["text"] = stripped
+                            self._anneal_stripped += 1
+            working = dict(example)
+            working["messages"] = cloned
+            working_examples.append(working)
+        return working_examples
+
     def __call__(self, examples):
         # dataset.py emits `images` as raw encoded bytes (Arrow-cache friendly); the
         # parent TRL collator expects decoded PIL images. Decode BEFORE the parent's
         # dispatch so both the parent's processing and our focal logic see PILs.
         # Chat-template kwargs are injected here rather than stored per-row (see
         # `_inject_chat_template_kwargs`).
+        examples = self._anneal_thoughts(examples)
         examples = _decode_raw_images(examples)
         examples = _inject_chat_template_kwargs(examples, self._chat_template_kwargs)
         return super().__call__(examples)

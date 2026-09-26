@@ -61,7 +61,7 @@ import shutil
 import subprocess
 from dataclasses import fields as dataclass_fields
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import torch
 from torch.utils.data import SequentialSampler
@@ -190,17 +190,78 @@ class SequentialSFTTrainer(SFTTrainer):
         return SequentialSampler(self.train_dataset)
 
 
+def _parse_thought_keep_schedule(raw: Optional[str]) -> Optional[List[float]]:
+    """Parse `--thought_keep_schedule` ("1.0,1.0,0.5,0.5,0.0") into a float list."""
+    if raw is None or not str(raw).strip():
+        return None
+    try:
+        schedule = [float(p) for p in str(raw).split(",") if p.strip()]
+    except ValueError as exc:
+        raise ValueError(
+            f"--thought_keep_schedule must be comma-separated floats, got {raw!r}") from exc
+    if not schedule:
+        return None
+    return schedule
+
+
+class ThoughtAnnealCallback(TrainerCallback):
+    """方案 T：每个 epoch 开始时把 collator 的 thought 保留概率推进到调度的下一档。
+
+    Reads `state.epoch` rather than counting internally so that resuming from a
+    checkpoint lands on the correct rung. At an epoch boundary HF has already set
+    `state.epoch` to the completed-epoch count (0.0 before the first epoch, 1.0
+    before the second, ...), so `int(epoch + 1e-6)` is the right index; the epsilon
+    guards against a 0.9999999 float landing one rung early.
+    """
+
+    def __init__(self, collator):
+        self.collator = collator
+
+    def _advance(self, state, label: str) -> None:
+        idx = int((state.epoch or 0.0) + 1e-6)
+        keep_p = self.collator.set_epoch(idx)
+        stats = self.collator.pop_anneal_stats()
+        observed = ""
+        if stats["seen"]:
+            observed = (f" | 上一阶段实测剥离 {stats['stripped']}/{stats['seen']} "
+                        f"({100 * stats['stripped'] / stats['seen']:.1f}%)")
+        print(f"[thought-anneal] {label} epoch {idx + 1}: keep_p={keep_p:.2f}{observed}",
+              flush=True)
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        self._advance(state, "训练启动")
+
+    def on_epoch_begin(self, args, state, control, **kwargs):
+        self._advance(state, "进入")
+
+    def on_train_end(self, args, state, control, **kwargs):
+        stats = self.collator.pop_anneal_stats()
+        if stats["seen"]:
+            print(f"[thought-anneal] 末阶段实测剥离 {stats['stripped']}/{stats['seen']} "
+                  f"({100 * stats['stripped'] / stats['seen']:.1f}%)", flush=True)
+
+
 def _setup_collator(trainer, args, processor):
     """Set the appropriate data collator on the trainer."""
     if args.full_trajectory:
+        schedule = _parse_thought_keep_schedule(
+            getattr(args, "thought_keep_schedule", None))
         trainer.data_collator = MultiStepVLMCollator(
             processor=processor,
             max_length=args.max_seq_length,
             focal_decay=args.focal_decay,
             focal_seed=args.seed,
+            thought_keep_schedule=schedule,
         )
+        if schedule is not None:
+            trainer.add_callback(ThoughtAnnealCallback(trainer.data_collator))
+            print(f"方案 T 思维退火已启用: keep_p 调度 = {schedule}", flush=True)
     elif not args.text_only:
         trainer.data_collator = ImmutableVisionCollatorAdapter(trainer.data_collator)
+        if getattr(args, "thought_keep_schedule", None):
+            raise ValueError(
+                "--thought_keep_schedule 仅对 --full_trajectory 生效："
+                "其他路径不用 MultiStepVLMCollator，thought 不会被剥离。")
 
 
 # ─── main training ────────────────────────────────────────────────────────────
@@ -392,6 +453,19 @@ def main():
         "the measured 56%% consecutive-repeat / 37%% pure-no-op rate of "
         "minecraft-text-action-dataset, which otherwise collapses checkpoints into "
         "always emitting 'move(0, 0) and press()'. Use 1.0 to disable.",
+    )
+    parser.add_argument(
+        "--thought_keep_schedule",
+        default=None,
+        help="方案 T（思维退火）：逗号分隔的每-epoch `Thought:` 保留概率，例如 "
+        "'1.0,1.0,0.5,0.5,0.0' = 前两轮全带 thought、中间两轮半数剥离、最后一轮"
+        "完全剥离。索引 = 已完成 epoch 数，短于 num_train_epochs 时保持最后一项。 "
+        "动机：v1/v2/D/struct/sstack 六个方案全部低于无-thought 对照（ctrl 31.5%），"
+        "其中 sstack 从 31.5% 续训 CoT 数据反降到 28.6%——thought 作为自回归文本"
+        "既挤占动作容量又在历史回放中放大幻觉。退火把 thought 降级为*训练脚手架*："
+        "末轮 keep_p=0 使推理路径与 ctrl 逐字同构（性能下界被锁死），从而检验"
+        "\"thought 的价值是否只在于训练期的表征塑造\"。仅对 --full_trajectory 生效；"
+        "省略则机制完全关闭。传 '0.0' 可得同数据的无-thought 对照臂。",
     )
     parser.add_argument(
         "--keep_no_op_p",
