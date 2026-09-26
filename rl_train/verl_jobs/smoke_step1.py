@@ -125,24 +125,23 @@ def check_c_real_checkpoint(model_path: str):
         return_dict=True, return_tensors="pt")
     inputs = {k: (v.cuda() if torch.is_tensor(v) else v) for k, v in inputs.items()}
 
-    # ① 原生 HF 前向（未 patch）——生成路径跳过：processor 产出的多模态键
-    # （mm_token_type_ids 等）与 generate() 的 kwargs 白名单不兼容，属脚本层
-    # 细节，与 verl 适配器无关；RL 训练只走 forward，这里验证 forward 即可。
-    with torch.no_grad():
-        native_out = model(**inputs, use_cache=False)
-    assert torch.isfinite(native_out.logits).all(), "native logits NaN/Inf"
-    print(f"[OK] 原生前向: logits{tuple(native_out.logits.shape)}", flush=True)
-
-    # ② patch 后带 labels 前向（log_probs 路径——训练时的真实调用形态）
+    # ⚠ 09-26：不做"未 patch 的原生前向"对照——apply_monkey_patch 是**类级**
+    # 补丁（Qwen3_5ForConditionalGeneration.forward = ...），check_b 里一旦调用
+    # 就对本进程内所有该类实例生效，此处再加载的真实模型同样已被 patch。
+    # 上一轮实测即因此拿到 logits=None（torch backend 返回 log_probs/entropy
+    # 而非 logits）而误报失败。RL 训练只走这条 PPO 前向，直接验证它即可。
     apply_monkey_patch(model, use_remove_padding=False,
                        use_fused_kernels=True, fused_kernels_backend="torch")
     with torch.no_grad():
         out = model(**inputs, temperature=1.0, use_cache=False)
-    if hasattr(out, "log_probs") and out.log_probs is not None:
-        assert torch.isfinite(out.log_probs).all(), "log_probs NaN/Inf"
-        print(f"[OK] patch 后前向: log_probs{tuple(out.log_probs.shape)}", flush=True)
-    else:
-        print(f"[INFO] patch 后无 log_probs（返回 {type(out).__name__}），检查字段", flush=True)
+    checked = []
+    for field in ("log_probs", "entropy", "logits"):
+        val = getattr(out, field, None)
+        if val is not None:
+            assert torch.isfinite(val).all(), f"{field} contains NaN/Inf"
+            checked.append(f"{field}{tuple(val.shape)}")
+    assert checked, f"前向输出无任何可校验字段（返回 {type(out).__name__}）"
+    print(f"[OK] 真实权重 PPO 前向（fla 内核 + 9B bf16）: {', '.join(checked)}", flush=True)
     PASS.append("C")
 
 
