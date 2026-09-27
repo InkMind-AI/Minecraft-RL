@@ -125,11 +125,13 @@ def check_c_real_checkpoint(model_path: str):
         return_dict=True, return_tensors="pt")
     inputs = {k: (v.cuda() if torch.is_tensor(v) else v) for k, v in inputs.items()}
 
-    # ⚠ 09-26：不做"未 patch 的原生前向"对照——apply_monkey_patch 是**类级**
-    # 补丁（Qwen3_5ForConditionalGeneration.forward = ...），check_b 里一旦调用
-    # 就对本进程内所有该类实例生效，此处再加载的真实模型同样已被 patch。
-    # 上一轮实测即因此拿到 logits=None（torch backend 返回 log_probs/entropy
-    # 而非 logits）而误报失败。RL 训练只走这条 PPO 前向，直接验证它即可。
+    # ⚠ 09-26/27：不做"未 patch 的原生前向"对照——apply_monkey_patch 是**类级**
+    # 补丁（Qwen3_5ForConditionalGeneration.forward = ...），同进程内 check_b 一旦
+    # 调用就对之后加载的同类模型全部生效，此处的"原生"其实已是 PPO 路径（返回
+    # log_probs/entropy、logits=None），c2 就是这样 isfinite(None) 误报失败的。
+    # 因此 C 层应由调用方以 `--only c` 起**独立进程**运行（见 main 的 --only）。
+    # 注：labels 不传也没问题——torch backend 会回退到 roll(input_ids)，
+    # 这正是 RL 训练算 old_log_probs 时的真实调用形态。
     apply_monkey_patch(model, use_remove_padding=False,
                        use_fused_kernels=True, fused_kernels_backend="torch")
     with torch.no_grad():
@@ -149,13 +151,30 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-path", default="/local-ssd/model_cache")
     ap.add_argument("--skip-real", action="store_true")
+    ap.add_argument("--only", default="",
+                    help="只跑指定层（逗号分隔，如 'c'）。因为 apply_monkey_patch 是"
+                         "类级补丁、会污染同进程内后续加载的同类模型，C 层应当由"
+                         "调用方用 --only c 起独立进程跑，才是真正干净的验证。")
     args = ap.parse_args()
-    check_a_imports()
-    check_b_adapter_tiny()
-    if not args.skip_real:
+
+    only = {s.strip().lower() for s in args.only.split(",") if s.strip()}
+    run_a = not only or "a" in only
+    run_b = not only or "b" in only
+    run_c = (not only or "c" in only) and not args.skip_real
+
+    if run_a:
+        check_a_imports()
+    if run_b:
+        check_b_adapter_tiny()
+    if run_c:
         check_c_real_checkpoint(args.model_path)
-    print(f"\nSMOKE_RESULT: {','.join(PASS)}"
-          f" {'✅ 全部通过' if len(PASS) == 3 else '（部分通过）'}", flush=True)
+
+    expected = sum([run_a, run_b, run_c])
+    ok = len(PASS) == expected and expected > 0
+    print(f"\nSMOKE_RESULT: {','.join(PASS) or '-'} "
+          f"({len(PASS)}/{expected}) {'✅ 通过' if ok else '❌ 未全通过'}", flush=True)
+    if not ok:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
