@@ -41,6 +41,35 @@ rl_train/
 **风险点**：FSDP × fla 线性注意力内核从未在 koala 验证（自研线是 DeepSpeed
 ZeRO-2）。不通则试 verl 的 DeepSpeed 后端，再不行退回自研线（止损 1 天）。
 
+#### ✅ 验收结果（09-27，`verl-c4`）
+
+```
+>>>>>>>>>> A+B（同进程）
+[OK] ulysses_sp_size>1 被正确拒绝
+[OK] torch backend 前向: log_probs(1, 11)
+SMOKE_RESULT: A,B (2/2) ✅ 通过
+>>>>>>>>>> C（独立进程，真实 9B 权重）
+model_type=qwen3_5
+[OK] 真实权重 PPO 前向（fla 内核 + 9B bf16）: log_probs(1, 90), entropy(1, 90)
+SMOKE_RESULT: C (1/1) ✅ 通过
+```
+
+**适配器层验收闭合**：`qwen35-9b-nf2-c3000-slim` 真实权重 + fla 内核 + verl PPO
+前向路径全部走通，log_probs/entropy 有限值。第 1 步的技术未知已清零。
+
+**C 层此前失败四次，全部是冒烟脚本自身的问题，与 verl 无关**（教训值得记住）：
+
+| 轮次 | 失败原因 | 修复 |
+|---|---|---|
+| `c` | `AutoModelForImageTextToText` 加载方式错 | 改用正确的 Auto 类 + `trust_remote_code` |
+| `c2` | `isfinite(None)`：`apply_monkey_patch` 是**类级**补丁，check_b 调用后 check_c 的"原生前向"其实已是 PPO 路径（`logits=None`） | 改为校验实际存在的字段 |
+| `c3` | **根本没入队**（提交输出被 watch 机制吞掉，误以为在跑） | 提交后必须核实队列/S3 日志目录 |
+| `c4` | — | **通过**。`--only` 让 C 在独立进程跑，从机制上消除类级补丁泄漏，不再靠注释规避；同时改为失败即 `exit(1)`（此前部分通过也返回 0） |
+
+**另一条有用的事实**：`forward_with_torch_backend` 在 `labels=None` 时回退到
+`torch.roll(input_ids, -1)`，因此不传 labels 也能算出 log_probs——这正是 RL 训练
+计算 `old_log_probs` 时的真实调用形态，C 层验的就是这条路径。
+
 ### Minecraft 环境接入
 
 ```
