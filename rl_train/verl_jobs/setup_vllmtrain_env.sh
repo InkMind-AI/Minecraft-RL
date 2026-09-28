@@ -155,6 +155,12 @@ _assert_torch_unchanged "③verl训练依赖"
 echo "[setup] ④ openagents（--no-deps）+ minestudio（--no-deps + 逐个补依赖）"
 pip install -e . --no-deps -q
 pip install -q --no-deps minestudio
+# Pyro4：minerl 与 Malmo Java 进程通信用的 RPC 库，只在真正 launch 一个 Malmo
+# 实例时才被 import（MinecraftSim() 实例化路径的更深处），不在任何 import 链
+# 探针能覆盖到的静态导入范围内——09-28 trainenv11 实测：D 层过、E 层（真正起
+# Malmo）才炸 `No module named 'Pyro4'`。minerl 生态惯用 4.76（更新版本对 RPC
+# 协议/serializer 有破坏性改动，未验证是否兼容，不冒险装最新版）。
+python -c "import Pyro4" 2>/dev/null || pip install -q --no-deps "Pyro4==4.76" "serpent>=1.41"
 # ⚠ 探针必须探到真正会被调用的深层路径，不能只 `import minestudio`：
 # minestudio/__init__.py 本身很浅，不会触发它自己的子模块树（utils.register
 # 需要 absl；utils.vpt_lib.actions 经 action_head 需要 gymnasium，这两条都是
