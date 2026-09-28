@@ -1121,6 +1121,12 @@ class RayPPOTrainer:
                                                                 envs=self.envs,
                                                                 is_train=True,
                                                                 )
+                        if self.config.algorithm.sfr.get("enabled", False):
+                            metrics.update({
+                                f"sfr/{key}": value
+                                for key, value in gen_batch_output.meta_info.items()
+                                if str(key).startswith("sfr_")
+                            })
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with _timer("gen_max", timing_raw):

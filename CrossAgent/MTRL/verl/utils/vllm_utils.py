@@ -46,11 +46,10 @@ try:
 except ImportError:
     pass
 
-from typing import List
+from typing import Any, List
 
 from msgspec import field
 from packaging import version as vs
-from vllm.lora.models import LoRAModel
 from vllm.lora.request import LoRARequest
 from vllm.lora.utils import get_adapter_absolute_path
 from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
@@ -107,7 +106,7 @@ class TensorLoRARequest(LoRARequest):
 class VLLMHijack():
     @staticmethod
     def hijack():
-        def hijack__load_adapter(self, lora_request: TensorLoRARequest) -> LoRAModel:
+        def hijack__load_adapter(self, lora_request: TensorLoRARequest) -> Any:
             """
             based on vllm.lora.worker_manager.WorkerLoRAManager._load_adapter, support load adapter with lora tensors
 
