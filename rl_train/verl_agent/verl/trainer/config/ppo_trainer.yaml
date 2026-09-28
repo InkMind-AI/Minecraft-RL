@@ -314,3 +314,11 @@ env:
   webshop:
     use_small: True
     human_goals: False
+  # 09-28 新增（Minecraft 接入）。Hydra struct 模式下不声明就无法从命令行覆盖，
+  # env_manager 读 config.env.minecraft.* 也会直接报错。
+  minecraft:
+    task_name: "mine_block:oak_log"   # 仅在 tasks 为空时作为单任务回退
+    tasks: null                       # 任务池：列表或逗号分隔字符串，支持通配（choose_available_task）
+    difficulty: easy                  # 与评测 easy-ng 基准一致
+    system_message_tag: text_action   # 与评测 SYSTEM_MESSAGE_TAG 一致
+    record_path: null                 # 设了才录像（耗磁盘，调试用）

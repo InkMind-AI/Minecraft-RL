@@ -69,10 +69,22 @@ from typing import List
 
 from msgspec import field
 from packaging import version as vs
-from vllm.lora.models import LoRAModel
-from vllm.lora.request import LoRARequest
-from vllm.lora.utils import get_adapter_absolute_path
-from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
+
+# 09-28：vllm.lora.* 的顶层导入在 vllm 0.17 下已失败（这几个符号被挪到别处），
+# 而我们不用 LoRA——不能让整个 vllm_utils 模块因此炸掉（fsdp_vllm 顶层 import
+# 它，会连累权重同步这条主链路）。降级为可选：拿不到就把 VLLMHijack.hijack()
+# 变成 no-op，TensorLoRARequest 变成占位类；两者都只在启用 LoRA 时才会被真正调用。
+try:
+    from vllm.lora.models import LoRAModel
+    from vllm.lora.request import LoRARequest
+    from vllm.lora.utils import get_adapter_absolute_path
+    from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
+    _LORA_AVAILABLE = True
+except ImportError as _lora_import_err:
+    LoRAModel = LoRARequest = LRUCacheWorkerLoRAManager = object
+    get_adapter_absolute_path = None
+    _LORA_AVAILABLE = False
+    _LORA_IMPORT_ERROR = _lora_import_err
 
 from verl.third_party.vllm import get_version
 
@@ -153,7 +165,15 @@ class TensorLoRARequest(LoRARequest):
 class VLLMHijack():
     @staticmethod
     def hijack():
-        def hijack__load_adapter(self, lora_request: TensorLoRARequest) -> LoRAModel:
+        if not _LORA_AVAILABLE:
+            # fsdp_vllm.__init__ 无条件调用这个（is_version_ge('vllm','0.7.3') 恒真）。
+            # 我们训练不启用 LoRA，这里静默跳过而不是让整条权重同步链路崩掉。
+            print(f"[vllm_utils] VLLMHijack.hijack() skipped: vllm.lora API unavailable "
+                  f"({_LORA_IMPORT_ERROR!r}); OK as long as no LoRA request is issued.",
+                  flush=True)
+            return
+
+        def hijack__load_adapter(self, lora_request: "TensorLoRARequest") -> "LoRAModel":
             """
             based on vllm.lora.worker_manager.WorkerLoRAManager._load_adapter, support load adapter with lora tensors
 
