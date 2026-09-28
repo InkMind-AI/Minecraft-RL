@@ -67,7 +67,55 @@ if ! python -c "from sam2.build_sam import build_sam2_camera_predictor" >/dev/nu
     done
 fi
 
-echo "[setup] openha env ready: python=$(python -V 2>&1), java=$(command -v java || echo MISSING)"
+# ⚠ 以下两段 09-28 补抄自 run_backbone_eval.sh（首版漏抄，verl-env-d4 实测：
+# 每个 Ray worker 在 MinecraftSim.__init__ -> check_engine() 里弹交互式
+# "download it from huggingface (Y/N)?"，非交互 job 直接 EOFError）。
+# **与评测脚本同一逻辑，改动时两处一起改。**
+
+# minestudio/minerl gpu_utils 需要这个版本的 cuda-python
+if ! python -c "from cuda import cuda, cudart" >/dev/null 2>&1; then
+    echo "[setup] pinning cuda-python==12.6.2.post1"
+    pip install -q "cuda-python==12.6.2.post1"
+fi
+
+# Malmo 模拟器引擎：优先 S3 镜像（HF Hub 匿名下载有 429 限流），失败再回退 HF，
+# 仍失败则 exit 1——不能放行到"每个 worker 各自 EOFError、0 rollout"的状态。
+ENGINE_MIRROR_S3_URI="s3://arcwm-code-us-west-2/axiom/assets/minestudio/engine.zip"
+_engine_ok() {
+    python -c "
+import os
+from minestudio.utils import get_mine_studio_dir
+assert os.path.exists(os.path.join(get_mine_studio_dir(), 'engine', 'build', 'libs', 'mcprec-6.13.jar'))
+" >/dev/null 2>&1
+}
+if ! _engine_ok; then
+    MS_DIR="${MINESTUDIO_DIR:-$(python -c 'from minestudio.utils import get_mine_studio_dir; print(get_mine_studio_dir())')}"
+    mkdir -p "$MS_DIR"
+    if aws s3 cp "$ENGINE_MIRROR_S3_URI" "$MS_DIR/engine.zip" --only-show-errors; then
+        echo "[setup] engine from S3 mirror, extracting..."
+        python -c "
+import os, zipfile
+d = '$MS_DIR'
+with zipfile.ZipFile(os.path.join(d, 'engine.zip')) as z:
+    z.extractall(d)
+os.remove(os.path.join(d, 'engine.zip'))
+"
+    else
+        echo "[setup] S3 mirror unavailable, falling back to HuggingFace"
+        for attempt in 1 2 3 4 5; do
+            python -c "from minestudio.simulator.entry import download_engine; download_engine()" && break
+            echo "[retry] download_engine failed (attempt ${attempt}/5), retry in 20s" >&2
+            sleep 20
+        done
+    fi
+    if ! _engine_ok; then
+        echo "[setup][FATAL] MineStudio engine still missing" >&2
+        exit 1
+    fi
+fi
+unset -f _engine_ok
+
+echo "[setup] openha env ready: python=$(python -V 2>&1), java=$(command -v java || echo MISSING), engine=OK"
 
 if [ "$_OPENHA_RESTORE_NOUNSET" = "1" ]; then set -u; fi
 unset _OPENHA_RESTORE_NOUNSET
