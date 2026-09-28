@@ -65,6 +65,7 @@ declare -A _PIP_NAME_MAP=(
     [dateutil]=python-dateutil [yaml]=PyYAML [PIL]=Pillow [cv2]=opencv-python
     [sklearn]=scikit-learn [absl]=absl-py [google]=protobuf [jwt]=PyJWT
     [Crypto]=pycryptodome [OpenSSL]=pyOpenSSL [dotenv]=python-dotenv
+    [antlr4]=antlr4-python3-runtime
 )
 _install_missing_no_deps() {
     local probe="$1"
@@ -136,6 +137,11 @@ pip install -e rl_train/verl_agent/ --no-deps -q
 pip install -q --no-deps accelerate codetiming datasets dill pandas peft pylatexenc 'ray[default]' \
   'tensordict>=0.8.0,<=0.10.0,!=0.9.0' torchdata wandb qwen-vl-utils pybind11 omegaconf hydra-core gym
 _install_missing_no_deps "import verl, agent_system, gigpo"
+# omegaconf/hydra-core 用 ANTLR4 解析插值语法（`from antlr4 import ...`），但只在
+# 真正解析带 `${...}` 插值的配置时才触发 import，`import omegaconf` 本身不会
+# 暴露这个缺口——09-28 实测：step③ 探针全绿，直到 step⑤ 最终验证才 FAIL。
+# 显式多探一次，提前暴露。
+_install_missing_no_deps "from omegaconf import OmegaConf; OmegaConf.create({'a': '\${b}', 'b': 1})['a']"
 _assert_torch_unchanged "③verl训练依赖"
 
 echo "[setup] ④ openagents（--no-deps）+ minestudio（--no-deps + 逐个补依赖）"
