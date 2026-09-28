@@ -1,391 +1,295 @@
-import ray
+"""Minecraft 环境包（verl-agent 多轮 rollout 用）。
+
+09-28 重写。原版来自 CrossAgent 抢救资产（rl_train/verl_port/env_minecraft/），
+是对着另一版 openagents 写的，对当前仓库而言**从未跑通过**，问题清单：
+
+  1. import 断裂：render_video_enable / InitialActionCallback / craft_item 的
+     三个符号在当前 openagents 里都不存在 → 模块一导入就 ImportError
+  2. env_init 调用契约不符：旧代码 `self.env, extra_info = env_init(**kwargs)`，
+     传 group_n/action_type/task_name 等关键字；当前 env_init 签名是
+     (task_config, rollout_path, args, ...) 且只返回 env → 必然 TypeError
+  3. 上面的 TypeError 被 `while True: try/except: retry` 包着 → **无限重试挂死**
+  4. reset 里 `time.sleep(random.randint(0, 180))` → 每次 reset 平均白等 90s
+  5. `self.tasks = env_kwargs["tasks"]`，但 env_manager 从不传 tasks → KeyError
+  6. save_render_videos 里有 `breakpoint()` → Ray worker 里会永久挂起
+  7. 同组（GRPO group）各 worker 各自调 choose_available_task → 各自随机 seed，
+     组内初始条件不同，组内相对优势失去可比性
+
+本版做法：
+  - 不经 env_init（它强制要求 rollout_path + args.fps 并写 raw_action.jsonl），
+    直接按 rollout_openha.py / env.py 的同一套 callback 组装 MinecraftSim，
+    录像变为可选
+  - 任务配置在 **组级** 采样一次，同组 group_n 个 worker 共享同一个 task_config
+    （同 seed、同出生点、同初始物品）——GRPO 组内对比的前提
+  - 所有重试有上限，超限直接抛错，不静默挂死
+  - 观测取 info["pov"]（与 OpenHA.gen_response 的 real_obs 一致），而非
+    obs["image"]（224×224 的低清副本）
+  - 成功判定与评测一致：reward > 0 即成功并终止（rollout_openha.py 同款）
+"""
+import copy
+import random
+import time
+import traceback
+from typing import Any, Dict, List, Optional
+
 import gym
 import numpy as np
-import traceback
-import random
-from minestudio.simulator.callbacks import RewardsCallback, CommandsCallback, RecordCallback
-from minestudio.simulator.entry import CameraConfig
-from minestudio.simulator.entry import MinecraftSim
-from openagents.utils.render import render_video_enable, save_render_videos
-from openagents.envs.callbacks.random_init_inventory import RandomInitInventoryCallback
-from openagents.envs.callbacks.initial_action import InitialActionCallback
-import copy
-import sys
-import os
-from openagents.envs.tasks.craft_item import get_available_craft_recipes, gen_craft_item_task_config_old, item_counts
-from datetime import datetime
-import time
-from minestudio.simulator.callbacks.reward_move import RewardsMoveCallback
+import ray
+
+# 与评测 rollout 完全相同的 callback 来源（openagents/envs/env.py）
+from openagents.envs.callbacks import (CommandsCallback, InitInventoryCallback,
+                                       RecordCallback, SummonMobsCallback)
 from openagents.envs.tasks.task_manager import choose_available_task
-from openagents.envs.env import env_init
-# -----------------------------------------------------------------------------
-# Ray remote worker actor -----------------------------------------------------
-# -----------------------------------------------------------------------------
+from minestudio.simulator import MinecraftSim
+from minestudio.simulator.callbacks import RewardsCallback
 
-@ray.remote(num_cpus=2)#resources={"minecraft_env": 0.98}, 
-class MinecraftWorker:
-    """Ray remote actor that replaces the worker function.
-    Each actor hosts a *WebAgentTextEnv* instance.
+MAX_SIM_CREATE_ATTEMPTS = 3
+# worker 启动错峰：避免 N 个 JVM 同时拉起抢资源。原版是 0-180s，这里压到 0-5s。
+STARTUP_JITTER_S = 5.0
+# 与评测 harness（run_backbone_eval.sh MAX_STEPS_NUM）一致
+DEFAULT_MAX_STEPS = 200
+
+
+def _info_for_transport(info: Dict[str, Any]) -> Dict[str, Any]:
+    """从 MineStudio 的 info 里挑出可序列化的小字段。
+
+    原始 info 里有 pov（640×360×3）等大数组，每步经 Ray 回传会成为吞吐瓶颈；
+    图像已作为观测单独返回，这里只保留标量/短字段。
     """
+    keep = {}
+    for k, v in (info or {}).items():
+        if isinstance(v, (bool, int, float, str)) or v is None:
+            keep[k] = v
+    return keep
 
-    def __init__(self, env_id: int = 0):
+
+def _build_sim(task_config: Dict[str, Any], record_path: Optional[str], fps: int = 20) -> MinecraftSim:
+    """按 openagents/envs/env.py::env_init 的同一套 callback 组装模拟器（录像可选）。"""
+    cb_cfg = task_config["callback"]
+    inv_cfg = cb_cfg["init_inventory"]
+    callbacks = [
+        InitInventoryCallback(
+            inv_cfg.get("init_inventory", []),
+            inventory_distraction_level=inv_cfg.get("inventory_distraction_level", [0]),
+            equip_distraction_level=inv_cfg.get("equip_distraction_level", [0]),
+            forbidden_slots=inv_cfg.get("forbidden_slots", []),
+        ),
+        RewardsCallback(task_config["rewards"]),
+        CommandsCallback(cb_cfg.get("commands", [])),
+    ]
+    if cb_cfg.get("mobs"):
+        callbacks.append(SummonMobsCallback(cb_cfg["mobs"]))
+    if record_path:
+        callbacks.insert(0, RecordCallback(record_path=record_path, fps=fps, frame_type="pov"))
+    return MinecraftSim(
+        action_type="env",
+        obs_size=(224, 224),
+        render_size=(640, 360),
+        seed=task_config["seed"],
+        preferred_spawn_biome=None,
+        camera_config=None,
+        callbacks=callbacks,
+    )
+
+
+# -----------------------------------------------------------------------------
+# Ray remote worker ------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+@ray.remote(num_cpus=2)
+class MinecraftWorker:
+    """一个 Ray actor 托管一个 MinecraftSim。"""
+
+    def __init__(self, env_id: int = 0, max_steps: int = DEFAULT_MAX_STEPS):
         self.env_id = env_id
+        self.max_steps = max_steps
+        self.env: Optional[MinecraftSim] = None
+        self.task_config: Optional[Dict[str, Any]] = None
         self.cur_step = 0
-        self.reset_num = 0
         self.won = False
-        
-    def step(self, action):
-        """Execute a step in the environment"""
+        self.done = False
+        self._last_pov: Optional[np.ndarray] = None
+        self._noop = None
 
-
-        #print("step with action:", action)
-        raw_action = action["raw_action"]
-        thought = action["thought"]
-        try:
-            obs, reward, terminated, truncated, info = self.env.step(raw_action)
-        except:
-            print("⏱️ MinecraftWorker step 超时，正在重试...)")
-            obs_image, info = self.reset()
-            return obs_image, 0,0, info
-            
-
-        print(f"env_id:{self.env_id}, Rollout step: {self.cur_step}")
-        self.cur_step += 1
-
-
-
-        if reward > 0:
-            self.won = True
-
-        info["won"] = self.won
-        info["step_count"] = self.cur_step
-        info["task_name"] = self.task_name
-        info["task_description"] = self.task_description
-        if reward > 0 and self.won:
-            terminated = True
-        
-        return obs["image"], reward, terminated, info
-        
-    def reset(self, env_kwargs= None):
-        """Reset the environment with given session index"""
-
-        if env_kwargs is not None:
-            self.env_kwargs = env_kwargs
-
-        self.task_name = self.env_kwargs["task_name"]
-        self.task_description = self.env_kwargs["task_description"]
-        self.won = False
-        self.record_path = self.env_kwargs.get("rollout_path", None)
-        datetime_str = datetime.now().strftime("%Y%m%d-%H%M%S")
-        self.record_path = None if self.record_path is None else os.path.join(self.record_path, f"{datetime_str}_reset_{self.reset_num}_{self.task_name}")       
-        
-        self.env_kwargs["rollout_path"] = self.record_path
-        
-        if getattr(self, "env", None) is not None:
-            self.env.close()
-            time.sleep(2)
-            del self.env
-
-        time.sleep(random.randint(0,180))
-
-        while True:
+    # ------------------------------------------------------------------
+    def _close_sim(self):
+        if self.env is not None:
             try:
-                self.env, extra_info = env_init(**self.env_kwargs)
-                break
-            except Exception as e:
-                print("⏱️ env_init 超时，正在重试...")
+                self.env.close()
+            except Exception:
                 traceback.print_exc()
-                if getattr(self, "env", None) is not None:
-                    try:
-                        self.env.close()
-                        del self.env
-                    except Exception:
-                        pass
-            time.sleep(random.randint(0,10))
-            
-        obs, info = extra_info["obs"], extra_info["info"]
+            self.env = None
 
-        info["won"] = self.won
-        info["step_count"] = self.cur_step
-        info["task_name"] = self.task_name
-        info["task_description"] = self.task_description
+    def _info(self, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        info = {
+            "won": self.won,
+            "step_count": self.cur_step,
+            "task_name": self.task_config["task_name"],
+            "task_description": self.task_config["task_description"],
+        }
+        if extra:
+            info.update(extra)
+        return info
+
+    def reset(self, task_config: Dict[str, Any], record_path: Optional[str] = None):
+        """用给定 task_config 起一局；同组 worker 收到的是同一个 task_config。"""
+        self._close_sim()
+        self.task_config = copy.deepcopy(task_config)
         self.cur_step = 0
-        self.reset_num += 1
-        return obs["image"], info
-    
-    def get_available_actions(self):
-        """Get available actions"""
-        return self.env.action_space
-    
-    def close(self):
-        """Close the environment"""
-        return self.env.close()
+        self.won = False
+        self.done = False
+        time.sleep(random.random() * STARTUP_JITTER_S)
 
-    def save_render_videos(self):
-        renderred_frames = render_video_enable(
-            self.record_path, 
-            enable_task_name=True, enable_rawaction=True, enable_thought=True, enable_envaction=True,enable_point_cot=False,
-            raw_action_max_length = 5,
-        )
-        #print(f"saving render video in {self.record_path} with {len(renderred_frames)} frames")
-        try:
-            save_render_videos(self.record_path, renderred_frames)
-            print("保存视频成功:", self.record_path)
-        except:
-            print("保存视频失败")
-            breakpoint()
+        last_err = None
+        for attempt in range(1, MAX_SIM_CREATE_ATTEMPTS + 1):
+            try:
+                self.env = _build_sim(self.task_config, record_path)
+                obs, info = self.env.reset()
+                for action in self.task_config.get("init_actions", []):
+                    obs, _r, _t, _tr, info = self.env.step(action)
+                # rollout_openha.py 在交给 agent 前先走一个 noop，这里保持一致
+                self._noop = self.env.noop_action()
+                obs, _r, _t, _tr, info = self.env.step(self._noop)
+                break
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                print(f"[MinecraftWorker {self.env_id}] sim 创建失败 "
+                      f"{attempt}/{MAX_SIM_CREATE_ATTEMPTS}: {e!r}", flush=True)
+                traceback.print_exc()
+                self._close_sim()
+                time.sleep(2 + random.random() * 3)
+        else:
+            raise RuntimeError(f"MinecraftWorker {self.env_id}: sim 创建连续失败") from last_err
+
+        self._last_pov = np.asarray(info.get("pov", obs["image"]), dtype=np.uint8)
+        return self._last_pov, self._info(_info_for_transport(info))
+
+    def step(self, action: Dict[str, Any]):
+        """action = {"raw_action": env_action_dict 或 None, "thought": str}。
+
+        已结束的 env 不再推进模拟器，直接回放终态（verl-agent 的 rollout 循环
+        会对整批调用 step，已 done 的样本也会收到动作）。
+        """
+        if self.done:
+            return self._last_pov, 0.0, True, self._info({"already_done": True})
+
+        env_action = action.get("raw_action") if isinstance(action, dict) else None
+        if env_action is None:
+            env_action = self._noop  # 非法动作按 noop 执行，valid 标志由 projection 负责
+
+        obs, reward, terminated, truncated, info = self.env.step(env_action)
+        self.cur_step += 1
+        reward = float(reward)
+        if reward > 0:  # 评测同款成功判定：拿到任务奖励即成功并终止
+            self.won = True
+        done = bool(self.won or terminated or truncated or self.cur_step >= self.max_steps)
+        self.done = done
+        self._last_pov = np.asarray(info.get("pov", obs["image"]), dtype=np.uint8)
+        return self._last_pov, reward, done, self._info(_info_for_transport(info))
+
+    def close(self):
+        self._close_sim()
+        return True
 
     def ready(self):
         return True
 
+
 # -----------------------------------------------------------------------------
-# Vectorised Ray environment --------------------------------------------------
+# Vectorised Ray environment ---------------------------------------------------
 # -----------------------------------------------------------------------------
 
 class MinecraftMultiProcessEnv(gym.Env):
-    """A vectorised, Ray-based wrapper around *WebAgentTextEnv*.
+    """env_num 个任务组 × 每组 group_n 个 worker（同组共享同一 task_config）。"""
 
-    ``info`` dictionaries returned by :py:meth:`step` **and** :py:meth:`reset`
-    automatically contain the key ``'available_actions'`` so downstream RL code
-    can obtain the *legal* action set without extra IPC overhead.
-    """
-    def kill_workers(self, close_timeout: int = 60):
-        """优雅关闭所有 workers，失败时强制 kill"""
-        if getattr(self, "_workers", None) is None:
-            return
-
-        try:
-            # 1. 并行触发 close()
-            close_refs = [w.close.remote() for w in self._workers]
-
-            # 2. 等待所有 worker close 完成（有超时）
-            try:
-                ray.get(close_refs, timeout=close_timeout)
-            except Exception as e:
-                print(f"⚠️ Some workers did not close gracefully: {e}")
-
-            # 3. 强制 kill 掉所有 worker，防止残留
-            for w in self._workers:
-                try:
-                    ray.kill(w, no_restart=True)
-                except Exception:
-                    pass
-
-        finally:
-            del self._workers
-
-
-    def reset_workers(self):
-        import gc
-        gc.collect()
-        self.kill_workers()
-        random.shuffle(self.tasks)
-        
-        while True:
-            try:
-                self._workers = []
-                futures = []
-                for idx in range(self.num_processes):
-                    task = self.tasks[idx // self.group_n]
-                    _env_kwargs = self.format_kwargs(task) #(self.rgs, idx)
-                    worker = (MinecraftWorker.remote(idx))
-                    self._workers.append(worker)
-                    futures.append(worker.reset.remote(_env_kwargs))
-                results = ray.get(futures, timeout = 1800)
-                break
-            except Exception as e:
-                print("⏱️ 创建 MinecraftWorker 超时，正在重试...")
-                traceback.print_exc()
-                self.kill_workers()
-
-        return results
-
-
-    def __init__(
-        self,
-        env_num: int = 1,
-        group_n: int = 1,
-        is_train: bool = True,
-        env_kwargs: dict = None,
-    ) -> None:
+    def __init__(self, env_num: int = 1, group_n: int = 1, is_train: bool = True,
+                 env_kwargs: Optional[dict] = None) -> None:
         super().__init__()
-
-        # Initialize Ray if not already initialized
-        if not ray.is_initialized():
-            ray.init()
-        self.reset_num = 0
-        self.group_n = group_n
+        env_kwargs = dict(env_kwargs or {})
+        if not is_train:
+            assert group_n == 1, "验证集不分组"
         self.env_num = env_num
+        self.group_n = group_n
         self.num_processes = env_num * group_n
         self.is_train = is_train
-        self.record_path = env_kwargs.get("rollout_path", None)
-        self.tasks = env_kwargs["tasks"]
-        if not is_train: assert group_n == 1
 
-        self._env_kwargs = env_kwargs if env_kwargs is not None else {'observation_mode': 'text', 'num_products': None}
-        self.reset_workers()
+        tasks = env_kwargs.get("tasks")
+        if not tasks:
+            # 兼容 env_manager 只给单个 task_name 的旧调用方式
+            tasks = [env_kwargs["task_name"]]
+        if isinstance(tasks, str):
+            tasks = [t.strip() for t in tasks.split(",") if t.strip()]
+        self.tasks: List[str] = list(tasks)
+        self.difficulty = env_kwargs.get("difficulty", "easy")
+        self.max_steps = int(env_kwargs.get("max_steps") or DEFAULT_MAX_STEPS)
+        self.record_path = env_kwargs.get("record_path")
+        self.reset_timeout_s = int(env_kwargs.get("reset_timeout_s", 900))
+        self.step_timeout_s = int(env_kwargs.get("step_timeout_s", 300))
+        self._rng = random.Random(env_kwargs.get("seed", 0) + (0 if is_train else 1000))
 
+        if not ray.is_initialized():
+            ray.init(ignore_reinit_error=True)
+        self._workers = [MinecraftWorker.remote(i, self.max_steps) for i in range(self.num_processes)]
+        self._closed = False
 
-    def format_kwargs(self, task): #minicase
-        task_config = choose_available_task(task,difficulty="zero")
-        env_kwargs = {
-            "group_n": self.group_n,
-            "action_type": "env",
-            "task_name": task_config['task_name'],
-            "task_description": task_config["task_description"],
-            "task_config": task_config,
-            "rollout_path": self.record_path,
-            "if_standard_camera_config": True,
-        }
-        return env_kwargs
+    # ------------------------------------------------------------------
+    def _sample_group_configs(self) -> List[Dict[str, Any]]:
+        configs = []
+        for _ in range(self.env_num):
+            task = self._rng.choice(self.tasks)
+            configs.append(choose_available_task(task, difficulty=self.difficulty))
+        return configs
 
-    def step(self, actions: list[str]):
-        if len(actions) != self.num_processes:
-            raise ValueError(
-                f'Expected {self.num_processes} actions, got {len(actions)}',
-            )
-
+    def reset(self):
+        group_configs = self._sample_group_configs()
         futures = []
-        while True:
-            try:        
-                for worker, action in zip(self._workers, actions):
-                    future = worker.step.remote(action)
-                    futures.append(future)
-                results = ray.get(futures)
-                break
-            except Exception as e:
-                print("⏱️ MinecraftWorker step 超时，正在重试...")
-                traceback.print_exc()
-                self.reset_workers()
+        for idx, worker in enumerate(self._workers):
+            cfg = group_configs[idx // self.group_n]
+            rec = None
+            if self.record_path:
+                rec = f"{self.record_path}/{cfg['task_name'].replace(':', '_')}/env{idx:03d}_{int(time.time())}"
+            futures.append(worker.reset.remote(cfg, rec))
+        results = ray.get(futures, timeout=self.reset_timeout_s)
+        obs_list = [r[0] for r in results]
+        info_list = [r[1] for r in results]
+        return obs_list, info_list
 
+    def step(self, actions: List[Dict[str, Any]]):
+        if len(actions) != self.num_processes:
+            raise ValueError(f"Expected {self.num_processes} actions, got {len(actions)}")
+        futures = [w.step.remote(a) for w, a in zip(self._workers, actions)]
+        results = ray.get(futures, timeout=self.step_timeout_s)
         obs_list, reward_list, done_list, info_list = [], [], [], []
         for obs, reward, done, info in results:
             obs_list.append(obs)
             reward_list.append(reward)
             done_list.append(done)
             info_list.append(info)
-            
         return obs_list, reward_list, done_list, info_list
 
-    def reset(self):
-        results = self.reset_workers()
-        obs_list, info_list = [], []
-        for obs, info in results:
-            obs_list.append(obs)
-            info_list.append(info)
-        self.reset_num+=1
-        return obs_list, info_list
-
-    # ------------------------------------------------------------------
-    # Convenience helpers ----------------------------------------------
-    # ------------------------------------------------------------------
-
-    # def render(self, mode: str = 'text', env_idx: int = None):
-    #     if env_idx is not None:
-    #         future = self._workers[env_idx].render.remote(mode)
-    #         return ray.get(future)
-
-    #     futures = []
-    #     for worker in self._workers:
-    #         future = worker.render.remote(mode)
-    #         futures.append(future)
-        
-    #     return ray.get(futures)
-
-    # ------------------------------------------------------------------
-    # Clean‑up ----------------------------------------------------------
-    # ------------------------------------------------------------------
-
     def close(self):
-        if getattr(self, '_closed', False):
+        if getattr(self, "_closed", True):
             return
-        self.kill_workers() 
+        try:
+            ray.get([w.close.remote() for w in self._workers], timeout=60)
+        except Exception:
+            traceback.print_exc()
+        for w in self._workers:
+            try:
+                ray.kill(w, no_restart=True)
+            except Exception:
+                pass
         self._closed = True
 
     def __del__(self):  # noqa: D401
-        self.close()
-
-    
-    # ------------------------------------------------------------------
-    # Single environment control (for async control) --------------------
-    # ------------------------------------------------------------------
-    def reset_single(self, env_id: int, env_kwargs: dict | None = None, start_time= 20):
-        """
-        Reset a single environment by env_id.
-
-        Returns:
-            obs (np.ndarray or list)
-            info (dict)
-        """
-
-        time.sleep(random.random()*start_time)
-        print(f"resetting env {env_id}")
-        w = self._workers[env_id]
-        assert 0 <= env_id < len(self._workers), f"Invalid env_id: {env_id}"
-        if env_kwargs is None:
-            idx = env_id // self.group_n #random.randint(0, len(self.tasks)-1)
-            task = self.tasks[idx]
-            env_kwargs = self.format_kwargs(task)
-
-        future = self._workers[env_id].reset.remote(env_kwargs)
-        obs, info = ray.get(future, timeout=1800)
-
-        print(f"resetting env {env_id} DONE")
-        return obs, info
-
-    def shuffle_tasks(self):
-        random.shuffle(self.tasks)
-
-    def step_single(self, env_id: int, action: dict):
-        """
-        Step only one environment (used for async control).
-
-        Args:
-            env_id: int
-            action: dict { "raw_action": ..., "thought": ... }
-
-        Returns:
-            obs, reward, done, info
-        """
-        assert 0 <= env_id < len(self._workers), f"Invalid env_id: {env_id}"
-        # while True:
-        #     try:
-        future = self._workers[env_id].step.remote(action)
-        obs, reward, done, info = ray.get(future, timeout=1800)
-                # break
-            # except Exception as e:
-            #     print(f"⚠️ step_single({env_id}) 出错，正在重置该 worker...")
-            #     traceback.print_exc()
-            #     # worker 崩了就重建
-            #     try:
-            #         ray.kill(self._workers[env_id], no_restart=True)
-            #     except Exception:
-            #         pass
-
-            #     kwargs = self.format_kwargs(self.tasks[env_id // self.group_n])
-            #     self.reset_single(env_id, kwargs)
-
-        return obs, reward, done, info #相比batch step, 没有打包成list
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
-
-
-# -----------------------------------------------------------------------------
-# Factory helper --------------------------------------------------------------
-# -----------------------------------------------------------------------------
-
-def build_minecraft_envs(
-    env_num: int = 1,
-    group_n: int = 1,
-    is_train: bool = True,
-    env_kwargs: dict = None,
-    
-):
-    """Mirror *build_sokoban_envs* so higher‑level code can swap seamlessly."""
-    return MinecraftMultiProcessEnv(
-        env_num=env_num,
-        group_n=group_n,
-        is_train=is_train,
-        env_kwargs=env_kwargs,
-    )
-
+def build_minecraft_envs(env_num: int = 1, group_n: int = 1, is_train: bool = True,
+                         env_kwargs: Optional[dict] = None):
+    """与 build_sokoban_envs 同形的工厂函数。"""
+    return MinecraftMultiProcessEnv(env_num=env_num, group_n=group_n,
+                                    is_train=is_train, env_kwargs=env_kwargs)

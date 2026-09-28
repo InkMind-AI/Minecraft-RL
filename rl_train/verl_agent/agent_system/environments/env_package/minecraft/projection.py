@@ -1,98 +1,72 @@
-from typing import List
-import re
+"""模型文本输出 → MineStudio env 动作（verl-agent projection 接口）。
 
-import ray
-import re
-import math
-from openagents.agents.utils.action_mapping import OneActionTokenizer, TextActionTokenizer
-import torch
-from minestudio.simulator.entry import MinecraftSim
-import random
+09-28 重写。原版两个问题：
+  1. `TextActionTokenizer.decode()` 在文本里找不到 `Action:` 时**不抛异常**，而是
+     静默返回一个空动作（见 action_mapping.py decode：`if not env_actions:
+     env_actions = [null_action]`）。原 projection 靠 try/except 判定合法性，于是
+     任何垃圾输出都被记为 valid=1 —— RL 永远不会因格式错误受罚。iter1 自举的
+     格式崩溃（100% 触顶 max_tokens、丢失动作语法）正是这类信号缺失的后果。
+  2. 模块顶层 import torch / MinecraftSim，以及一段 qwen2_vl 保留 token 的
+     死代码（get_sim/raw_str2env，全仓无调用方）——拖慢导入且与本模型无关。
 
+合法性判定与 OpenHA 解码路径一致（同一个 TextActionTokenizer），且比"有 Action:
+前缀"更严：匹配到的动作片段里必须含至少一个可识别原语——move(dx,dy) / press(...)
+/ click(left|right) / no_op。否则像 iter1 崩溃样例 `Action: Walk forward across
+the terrain` 这种**有前缀、无语法**的自然语言也会被判 valid，然后静默解码成空动作。
+"""
+from typing import Any, Dict, List, Tuple
 
-def get_sim():
-    global _sim, _tokenizer, _qwen2vl_token2id_lst
-    if _sim is None:
-        print("[Info] Initializing MinecraftSim and OneActionTokenizer for COA-Craft...")
-        _tokenizer = OneActionTokenizer("qwen2_vl")
-        _sim = MinecraftSim(camera_config=_tokenizer.camera_config)
-        _qwen2vl_token2id_lst = [
-                [('<|reserved_special_token_178|>', 151835), ('<|reserved_special_token_179|>', 151836),],
-                [["<|reserved_special_token_180|>", 151837], ["<|reserved_special_token_181|>", 151838], ["<|reserved_special_token_182|>", 151839], ["<|reserved_special_token_183|>", 151840], ["<|reserved_special_token_184|>", 151841], ["<|reserved_special_token_185|>", 151842], ["<|reserved_special_token_186|>", 151843], ["<|reserved_special_token_187|>", 151844], ["<|reserved_special_token_188|>", 151845], ["<|reserved_special_token_189|>", 151846]], 
-                [["<|reserved_special_token_190|>", 151847], ["<|reserved_special_token_191|>", 151848], ["<|reserved_special_token_192|>", 151849]], 
-                [["<|reserved_special_token_193|>", 151850], ["<|reserved_special_token_194|>", 151851], ["<|reserved_special_token_195|>", 151852]], 
-                [["<|reserved_special_token_196|>", 151853], ["<|reserved_special_token_197|>", 151854], ["<|reserved_special_token_198|>", 151855]], 
-                [["<|reserved_special_token_199|>", 151856], ["<|reserved_special_token_200|>", 151857]],  # use
-                [["<|reserved_special_token_201|>", 151858], ["<|reserved_special_token_202|>", 151859]],  # drop
-                [["<|reserved_special_token_203|>", 151860], ["<|reserved_special_token_204|>", 151861]],  # attack
-                [["<|reserved_special_token_205|>", 151862], ["<|reserved_special_token_206|>", 151863]],  # jump
-                [["<|reserved_special_token_207|>", 151864], ["<|reserved_special_token_208|>", 151865],],  # camera
-                [["<|reserved_special_token_176|>", 151833], ["<|reserved_special_token_177|>", 151834],],
-                [["<|reserved_special_token_209|>", 151866], ["<|reserved_special_token_210|>", 151867], ["<|reserved_special_token_211|>", 151868], ["<|reserved_special_token_212|>", 151869], ["<|reserved_special_token_213|>", 151870], ["<|reserved_special_token_214|>", 151871], ["<|reserved_special_token_215|>", 151872], ["<|reserved_special_token_216|>", 151873], ["<|reserved_special_token_217|>", 151874], ["<|reserved_special_token_218|>", 151875], ["<|reserved_special_token_219|>", 151876], ["<|reserved_special_token_220|>", 151877], ["<|reserved_special_token_221|>", 151878], ["<|reserved_special_token_222|>", 151879], ["<|reserved_special_token_223|>", 151880], ["<|reserved_special_token_224|>", 151881], ["<|reserved_special_token_225|>", 151882], ["<|reserved_special_token_226|>", 151883], ["<|reserved_special_token_227|>", 151884], ["<|reserved_special_token_228|>", 151885], ["<|reserved_special_token_229|>", 151886]], 
-                [["<|reserved_special_token_230|>", 151887], ["<|reserved_special_token_231|>", 151888], ["<|reserved_special_token_232|>", 151889], ["<|reserved_special_token_233|>", 151890], ["<|reserved_special_token_234|>", 151891], ["<|reserved_special_token_235|>", 151892], ["<|reserved_special_token_236|>", 151893], ["<|reserved_special_token_237|>", 151894], ["<|reserved_special_token_238|>", 151895], ["<|reserved_special_token_239|>", 151896], ["<|reserved_special_token_240|>", 151897], ["<|reserved_special_token_241|>", 151898], ["<|reserved_special_token_242|>", 151899], ["<|reserved_special_token_243|>", 151900], ["<|reserved_special_token_244|>", 151901], ["<|reserved_special_token_245|>", 151902], ["<|reserved_special_token_246|>", 151903], ["<|reserved_special_token_247|>", 151904], ["<|reserved_special_token_248|>", 151905], ["<|reserved_special_token_249|>", 151906], ["<|reserved_special_token_250|>", 151907]],
-        ]
-    return _sim, _tokenizer, _qwen2vl_token2id_lst
+from openagents.agents.utils.action_mapping import TextActionTokenizer
+
+_tokenizer = None
 
 
-def raw_str2env(reserved_tokens_str):
-    sim, tokenizer, qwen2vl_token2id_lst = get_sim()
-    reserved_tokens_list = reserved_tokens_str.split("<")
-    reserved_tokens_list = ["<" + token for token in reserved_tokens_list if token]
-    
-    token2id_dct = {}
-    for token_list in qwen2vl_token2id_lst:
-        for token, id in token_list:
-            token2id_dct[token] = id
-
-    reserved_tokens_list = [token2id_dct[token] for token in reserved_tokens_list if token in token2id_dct]
-    return sim.agent_action_to_env_action(tokenizer.decode(reserved_tokens_list)[0])
+def _get_tokenizer() -> TextActionTokenizer:
+    global _tokenizer
+    if _tokenizer is None:
+        # 与 OpenHA text_action 分支相同的默认：act_beg_token="Action:"、chunk_len=1
+        _tokenizer = TextActionTokenizer()
+    return _tokenizer
 
 
-# def minecraft_projection(actions: List[str]):
-#     """
-#     A function to process the actions.
-#     actions: the list of actions to be processed, it is a list of strings.
-#     Expected format:
-#         <think>some reasoning...</think><action>up/down/left/right/still</action>
-#     """
+def _has_action_primitive(tok: TextActionTokenizer, text: str) -> bool:
+    """文本中至少一个 `Action:` 片段含可识别的动作原语。"""
+    for seg in tok.action_re.findall(text):
+        seg = seg.strip()
+        if "no_op" in seg:
+            return True
+        if tok.camera_re.search(seg) or tok.keyboard_re.search(seg):
+            return True
+        for part in seg.split(" and "):
+            if tok.mouse_click_re.match(part.strip()):
+                return True
+    return False
 
-#     valids = [0] * len(actions)
 
-#     for i in range(len(actions)):
-#         try:
-#             actions[i] = raw_str2env(actions[i])
-#             valids[i] = 1
-#         except Exception as e:
-#             print(f"Error processing action {i}: {actions[i]}")
-#             print(f"Exception: {e}")
-#             actions[i] = None
-#             valids[i] = 0
-            
-#     return actions, valids
-    
-tokenizer = None
-def minecraft_projection(actions: List[str]):
-    global tokenizer
-    if tokenizer is None:
-        tokenizer = TextActionTokenizer()
-    valids = [0] * len(actions)
+def minecraft_projection(actions: List[str]) -> Tuple[List[Dict[str, Any]], List[int]]:
+    """把一批模型输出解码为 env 动作。
 
-    for i in range(len(actions)):
+    返回 (projected, valids)：
+      projected[i] = {"raw_action": env_action_dict 或 None, "thought": 原始文本}
+      valids[i]    = 1 当且仅当文本里有可解析的 `Action:` 片段
+    raw_action=None 时 worker 会按 noop 执行（见 envs.py MinecraftWorker.step）。
+    输入列表不做原地修改。
+    """
+    tok = _get_tokenizer()
+    projected: List[Dict[str, Any]] = []
+    valids: List[int] = []
+    for text in actions:
+        text = text if isinstance(text, str) else ""
         try:
-            actions[i] = {
-                "raw_action": tokenizer.decode(actions[i])[0],
-                "thought": actions[i]
-            }
-            valids[i] = 1
-            
-        except Exception as e:
-            print(f"Error processing action {i}: {actions[i]}")
-            print(f"Exception: {e}")
-            actions[i] = {
-                "raw_action": None,
-                "thought": None
-            }
-            valids[i] = 0
-    
-    
-    return actions, valids
+            if not _has_action_primitive(tok, text):
+                projected.append({"raw_action": None, "thought": text})
+                valids.append(0)
+                continue
+            env_action = tok.decode(text)[0]
+            projected.append({"raw_action": env_action, "thought": text})
+            valids.append(1)
+        except Exception as e:  # noqa: BLE001
+            print(f"[minecraft_projection] 解码失败: {e!r} | text={text[:120]!r}", flush=True)
+            projected.append({"raw_action": None, "thought": text})
+            valids.append(0)
+    return projected, valids

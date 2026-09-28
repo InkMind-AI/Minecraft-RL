@@ -599,6 +599,69 @@ class AppWorldEnvironmentManager(EnvironmentManagerBase):
                 postprocess_text_obs.append(obs)
         return postprocess_text_obs
 
+
+class MinecraftEnvironmentManager(EnvironmentManagerBase):
+    """Minecraft（MineStudio/Malmo）多轮 rollout 的环境管理器。
+
+    09-28 新增。此前 minecraft 分支直接复用 WebshopEnvironmentManager，而后者：
+      - reset 时 `extract_task` 对观测做 `obs.split(" [SEP] ")`——我们的观测是
+        图像 ndarray，第一步就会 AttributeError
+      - 返回 `'image': None` —— 视觉策略拿不到任何画面
+    所以此前那个"已注册"的分支从未能跑过一步。
+
+    **prompt 必须与 SFT / 评测逐字对齐**（iter1 自举的格式崩溃说明分布偏移的代价）：
+    OpenHA.gen_response 的用户消息 content 顺序是 [text(system_message+instruction),
+    image]，system_message = get_system_prompt("text_action")，instruction =
+    task_config["task_description"]。这里生成 `system+instruction<image>`，verl-agent
+    rollout 会把 `<image>` 展开为 `<|vision_start|>…<|vision_end|>`，顺序一致。
+
+    ⚠ 已知差距（迁移第 3 步处理）：评测协议是 h29 多图历史，但 verl-agent 的
+    rollout_loop.preprocess_single_sample 每个样本只放 1 张图。当前等价于"每一步都是
+    轨迹首帧"——这恰好是 SFT 数据里第一个 turn 的格式，属于分布内，能跑通 RL，
+    但策略看不到历史，和评测条件不同。
+    """
+
+    def __init__(self, envs, projection_f, config):
+        super().__init__(envs, projection_f, config)
+        from openagents.agents.utils.system_prompt import get_system_prompt
+        mc_cfg = config.env.get("minecraft", {}) if hasattr(config.env, "get") else {}
+        tag = mc_cfg.get("system_message_tag", "text_action") if mc_cfg else "text_action"
+        self.system_message = get_system_prompt(tag)
+        history_length = int(config.env.get("history_length", 0) or 0)
+        if history_length > 0:
+            print(f"[MinecraftEnvironmentManager] ⚠ env.history_length={history_length} 被忽略："
+                  f"当前 rollout 每样本只支持 1 张图，按单帧 prompt 运行", flush=True)
+        self.tasks: List[str] = []
+
+    def _texts(self, n: int) -> List[str]:
+        return [f"{self.system_message}{self.tasks[i]}<image>" for i in range(n)]
+
+    @staticmethod
+    def _stack(images):
+        return np.stack([np.asarray(im, dtype=np.uint8) for im in images], axis=0)
+
+    def reset(self, kwargs) -> Tuple[Dict[str, Any], List[Dict]]:
+        obs, infos = self.envs.reset()
+        self.tasks = [info["task_description"] for info in infos]
+        texts = self._texts(len(obs))
+        return {"text": texts, "image": self._stack(obs), "anchor": list(texts)}, infos
+
+    def step(self, text_actions: List[str]):
+        actions, valids = self.projection_f(text_actions)
+        next_obs, rewards, dones, infos = self.envs.step(actions)
+        for i, info in enumerate(infos):
+            info["is_action_valid"] = to_numpy(valids[i])
+        texts = self._texts(len(next_obs))
+        next_observations = {"text": texts, "image": self._stack(next_obs), "anchor": list(texts)}
+        return next_observations, to_numpy(rewards), to_numpy(dones), infos
+
+    def close(self) -> None:
+        try:
+            self.envs.close()
+        except Exception:
+            pass
+
+
 def make_envs(config):
     """
     Create enviroments 
@@ -662,22 +725,26 @@ def make_envs(config):
         val_envs = SokobanEnvironmentManager(_val_envs, projection_f, config)
         return envs, val_envs
     elif "minecraft" in config.env.env_name.lower():
-        # 09-24 接入（迁移第 2 步）：env 包来自 CrossAgent 抢救资产
-        # （rl_train/verl_port/env_minecraft/）。MinecraftMultiProcessEnv 与 webshop
-        # 同为 WebAgentTextEnv/Ray 封装，Manager 先复用 Webshop 实现；
-        # info/reward 契约与任务采样（easy 池）的适配验证是迁移第 2 步工作项。
+        # 09-28 改写：原先复用 WebshopEnvironmentManager 从未能跑通（见
+        # MinecraftEnvironmentManager 文档串）。env 包也已按当前 openagents API 重写。
         from agent_system.environments.env_package.minecraft import build_minecraft_envs, minecraft_projection
+        mc = config.env.minecraft
+        tasks = mc.get("tasks", None) or [mc.task_name]
+        if isinstance(tasks, str):
+            tasks = [t.strip() for t in tasks.split(",") if t.strip()]
         env_kwargs = {
-            'task_name': config.env.minecraft.task_name,
-            'task_description': config.env.minecraft.task_description,
+            'tasks': list(tasks),
+            'difficulty': mc.get("difficulty", "easy"),
             'max_steps': config.env.max_steps,
+            'record_path': mc.get("record_path", None),
+            'seed': config.env.seed,
         }
         _envs = build_minecraft_envs(config.data.train_batch_size, group_n, is_train=True, env_kwargs=env_kwargs)
         _val_envs = build_minecraft_envs(config.data.val_batch_size, 1, is_train=False, env_kwargs=env_kwargs)
 
         projection_f = partial(minecraft_projection)
-        envs = WebshopEnvironmentManager(_envs, projection_f, config)
-        val_envs = WebshopEnvironmentManager(_val_envs, projection_f, config)
+        envs = MinecraftEnvironmentManager(_envs, projection_f, config)
+        val_envs = MinecraftEnvironmentManager(_val_envs, projection_f, config)
         return envs, val_envs
     elif "webshop" in config.env.env_name.lower():
         from agent_system.environments.env_package.webshop import build_webshop_envs, webshop_projection
