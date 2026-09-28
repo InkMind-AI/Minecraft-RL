@@ -56,7 +56,10 @@ _assert_torch_unchanged() {
 #      需要更新的 huggingface_hub 才有 is_offline_mode；普通 install 不生效，
 #      必须 --upgrade）
 #   ③ 版本门禁 "X>=A,<B is required ... but found X==C" -> 钉版本区间
-# 最多试 8 轮，每轮最多处理一个新缺陷，链式缺失逐层剥开。
+# 最多试 20 轮，每轮最多处理一个新缺陷，链式缺失逐层剥开。minerl/minestudio 的
+# 依赖树比预想深得多（09-28 实测：absl→gymnasium→gym3→imageio→coloredlogs→
+# humanfriendly→daemoniker→lxml 连续 8 层，8 轮上限恰好用尽还没到底），
+# 20 轮留足够余量。
 #
 # ⚠ 导入名 ≠ PyPI 包名的情况（`pip install $mod` 会装错包或直接 404）：
 # 09-28 实测 dateutil（PyPI 是 python-dateutil）连续 8 轮无效才发现。这里只维护
@@ -74,7 +77,7 @@ declare -A _PIP_NAME_MAP=(
 )
 _install_missing_no_deps() {
     local probe="$1"
-    for _ in 1 2 3 4 5 6 7 8; do
+    for _ in $(seq 1 20); do
         local out rc
         out="$(python -c "$probe" 2>&1)"; rc=$?
         if [ "$rc" -eq 0 ]; then return 0; fi
