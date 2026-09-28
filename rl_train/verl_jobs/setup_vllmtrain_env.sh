@@ -65,7 +65,12 @@ declare -A _PIP_NAME_MAP=(
     [dateutil]=python-dateutil [yaml]=PyYAML [PIL]=Pillow [cv2]=opencv-python
     [sklearn]=scikit-learn [absl]=absl-py [google]=protobuf [jwt]=PyJWT
     [Crypto]=pycryptodome [OpenSSL]=pyOpenSSL [dotenv]=python-dotenv
-    [antlr4]=antlr4-python3-runtime
+    # ⚠ 不能装最新版：omegaconf 的语法文件是用 ANTLR 4.9.x 生成的（ATN 序列化
+    # 版本 3），装 antlr4-python3-runtime 最新版（4.13.x，ATN v4）会在真正解析
+    # 插值语法时报 "Could not deserialize ATN with version 3 (expected 4)"——
+    # 09-28 trainenv7 实测踩到。这是 OmegaConf/Hydra 生态里的经典版本坑，必须
+    # 精确钉 4.9.*，与 omegaconf 官方 requirements 一致。
+    [antlr4]="antlr4-python3-runtime==4.9.*"
 )
 _install_missing_no_deps() {
     local probe="$1"
