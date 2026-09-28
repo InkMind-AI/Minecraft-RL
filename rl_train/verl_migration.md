@@ -114,6 +114,27 @@ def minecraft_reward(frames_count, ...):
 4. verl-agent 全仓较大，vendor 时评估只留必要子树
    （verl/ + agent_system/ + gigpo/ + examples/ 参考 + setup 文件），不带
    docs/tests/.github
+5. **openha env 不是镜像预装的**：它由 `run_backbone_eval.sh` 在运行时创建。环境侧
+   verl 任务如果自己 `conda activate openha || true`，会静默失败并跑在 base env
+   （verl-env-d1：`No module named 'torch'`）。统一改为
+   `source rl_train/verl_jobs/setup_openha_env.sh`
+6. **conda 钩子不兼容 `set -u`**：openjdk 包的 `deactivate.d/openjdk_deactivate.sh`
+   直接读 `$JAVA_HOME_CONDA_BACKUP`，在调用方 `set -euo pipefail` 下装完 openjdk
+   就退出（verl-env-d2）。setup 脚本进入时关 nounset、结束时按原样恢复
+7. **提交 ≠ 入队**：koala 提交输出偶尔被 watch 机制吞掉（c3 从未入队），`koala ls`
+   也偶尔抽风返回空。**判定标准一律是 S3 日志目录
+   `axiomjin/.koala-logs/<job>-*/` 是否存在**
+
+## 第 2 步（环境接入）验收：进行中
+
+`smoke_step2.py` 三层：D（projection 解码/非法降级）、E（Ray+Malmo `reset()`）、
+F（`step()` 的 obs/reward/done/info 契约 + 打出 info 键，供 reward 契约对齐）。
+
+| 轮次 | 结果 | 原因 |
+|---|---|---|
+| d1 | ❌ D/E/F 全挂 | 跑在 base env（坑 5） |
+| d2 | ❌ 没跑到 D | 装完 openjdk 后 nounset 退出（坑 6） |
+| d3 | ⏳ 在跑 | — |
 
 
 ## VERL_AGENT_COMMIT

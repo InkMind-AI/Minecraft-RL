@@ -224,3 +224,38 @@ unbound variable——已修（纯数字才提示 +1）。
 2. 若 ≥ 基线：跑 iter2/iter3 看多轮趋势 + 监控发射率与 thought 多样性
 3. 若 < 基线：上信号1（meta_info 真值 verifier，设计见 §3.3）再迭代
 4. 并行：把信号1 verifier 开发排期（与 Phase 1 标注升级共享组件）
+
+## ⚠️ iteration-1 结果（09-28）：权重崩溃，不能评测
+
+iter1c 评测跑了 23h 仍在第 1 个 episode 的第 9 步（70-81 s/step，SFT 权重是
+1.04 s/step），已删除。诊断探针 `rl_train/diag/probe_policy.py`（vLLM 离线，
+同 prompt，n=8，max_tokens=256）直接比对自举前后：
+
+| 指标 | v2-e4（起点） | iter1/final（自举后） |
+|---|---|---|
+| 生成 token 中位数 | 13 | **256（=上限）** |
+| 触顶 max_tokens | 0% | **100%** |
+| 含 `Action:` | 100% | 50% |
+| 典型输出 | `Action: move(0, 0) and press()` | `<think>\n\n</think>\n\nAction: Walk forward across the terrain\nReason: ...`（无限续写） |
+
+**这不只是 EOS 丢失，是格式整体崩溃**，三个症状：
+1. **不再停止**：100% 触顶，每步都生成满 256 token → 评测慢 70 倍的直接原因
+2. **动作语法丢失**：`Action: Walk forward...` 是自然语言，不是 `move(dx,dy) and
+   press(...)` 语法，projection 解析不了
+3. **Qwen3 思维模板泄漏**：`<think>\n\n</think>` 反复出现——训练数据里没有这个，
+   是基座 chat template 的 thinking 块。说明 GRPO 训练把模型推离了 SFT 格式，
+   回落到了基座的先验
+
+**根因候选**（按可能性排序，下一步逐一核对 `train_grpo.py` / `rl_build_batch.py`）：
+- **chat template 不一致**：训练时渲染的 prompt 是否带了 `enable_thinking=False`？
+  SFT collator 从 processor 解析并注入 `chat_template_kwargs`（见 collators.py
+  `_resolve_chat_template_kwargs`），自研 GRPO 很可能没做 → 训练序列里出现空的
+  `<think></think>` 块，模型学会了生成它
+- **`<|im_end|>` 未进 loss**：thought 加权 loss 若只覆盖 thought/action 文本 token，
+  EOS 就失去监督
+- **无 KL 约束 / LR 过大**：`verl_migration.md` 已记录 iteration-1 "pg 失控"，
+  首个 verl 配置因此加了 low_var_kl coef 0.01
+
+**结论**：自研线 iteration-1 作废。这个问题**不依赖迁移**——哪怕换到 verl，
+chat template 对不上也会同样崩。所以修复点要在 rollout→训练样本的渲染一致性上，
+两条线共用。
