@@ -10,7 +10,16 @@
 #   2. 每个 verl 任务里重抄一遍这段安装逻辑，迟早与评测侧漂移。
 #
 # 用法： source rl_train/verl_jobs/setup_openha_env.sh   # 之后即处于 openha env
-set -euo pipefail
+#
+# ⚠ 09-28：本文件是被 source 的，所以**不能**开 `set -u`。conda 的 activate/deactivate
+# 钩子不兼容 nounset——openjdk 包自带的 deactivate.d/openjdk_deactivate.sh 第 3 行
+# 直接读 $JAVA_HOME_CONDA_BACKUP，未定义时在 -u 下立即报错退出（verl-env-d2 实测：
+# 装完 openjdk 后脚本死在 "JAVA_HOME_CONDA_BACKUP: unbound variable"）。
+# run_backbone_eval.sh 从没开 -u，所以评测侧一直没踩到。
+# 这里的做法：进入时记下调用方是否开了 nounset，整段关掉，结束时按原样恢复。
+case "$-" in *u*) _OPENHA_RESTORE_NOUNSET=1 ;; *) _OPENHA_RESTORE_NOUNSET=0 ;; esac
+set +u
+set -eo pipefail
 
 REPO_ROOT="${REPO_ROOT:-/data/work/run_codes/Minecraft-CoT}"
 source /opt/conda/etc/profile.d/conda.sh
@@ -59,3 +68,6 @@ if ! python -c "from sam2.build_sam import build_sam2_camera_predictor" >/dev/nu
 fi
 
 echo "[setup] openha env ready: python=$(python -V 2>&1), java=$(command -v java || echo MISSING)"
+
+if [ "$_OPENHA_RESTORE_NOUNSET" = "1" ]; then set -u; fi
+unset _OPENHA_RESTORE_NOUNSET
