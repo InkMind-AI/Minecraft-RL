@@ -36,6 +36,20 @@ import gym
 import numpy as np
 import ray
 
+# ⚠ 09-28：numpy 2.0 移除了 `np.unicode_`（改名 `np.str_`），而 minestudio 内置
+# 的 minerl fork（herobraine/hero/spaces.py 的 Text space）还在用旧名——不是
+# 我们的代码问题，是第三方库对 numpy 2.x 的兼容缺口。verl 训练 env（vllmtrain，
+# vllm 0.17/torch 2.10 要求 numpy>=2）不能像评测 openha env（numpy 1.26.4）
+# 那样靠装老版本 numpy 绕开：vllm/transformers 那一侧才是真正需要 numpy 2 的一方。
+# 官方 numpy 2.0 迁移指南给的标准做法就是这个别名 shim；必须在 `from
+# minestudio.simulator import MinecraftSim` 之前打上（MinecraftSim() 实例化时
+# 才会真正触发 herobraine 的 space 构造，见 verl-trainenv10 实测的完整调用栈：
+# envs.py::_build_sim -> MinecraftSim.__init__ -> HumanSurvival.__init__ ->
+# env_spec.reset() -> create_observables() -> spaces.Text.__init__ ->
+# AttributeError: `np.unicode_` was removed in the NumPy 2.0 release）。
+if not hasattr(np, "unicode_"):
+    np.unicode_ = np.str_
+
 # 与评测 rollout 完全相同的 callback 来源（openagents/envs/env.py）
 from openagents.envs.callbacks import (CommandsCallback, InitInventoryCallback,
                                        RecordCallback, SummonMobsCallback)
