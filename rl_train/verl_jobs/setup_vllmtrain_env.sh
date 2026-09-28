@@ -35,11 +35,22 @@ echo "[setup] ① Qwen3.5 支持：transformers 5.15"
 python -c "from transformers import Qwen3_5ForConditionalGeneration" 2>/dev/null \
   || pip install -q 'transformers==5.15.0'
 
-echo "[setup] ② 线性注意力内核（fla / causal-conv1d / flash-attn）"
+echo "[setup] ② 线性注意力内核（fla / causal-conv1d）"
 python -c 'import fla' 2>/dev/null || pip install -q flash-linear-attention
+# causal-conv1d 也是源码编译（CUDA 扩展），同样可能在新 torch/CUDA 组合下编译
+# 异常缓慢——加 10 分钟超时，超时不阻塞整个 setup（fla 的 Triton 纯 Python 回退
+# 路径在 fla 内部会自动接管，只是慢一些，不是功能缺失）。
 python -c 'import causal_conv1d' 2>/dev/null \
-  || CAUSAL_CONV1D_FORCE_BUILD=TRUE MAX_JOBS=16 pip install -q --no-build-isolation causal-conv1d
-python -c 'import flash_attn' 2>/dev/null || pip install -q flash-attn --no-build-isolation
+  || timeout 600 env CAUSAL_CONV1D_FORCE_BUILD=TRUE MAX_JOBS=16 pip install -q --no-build-isolation causal-conv1d \
+  || echo "[setup][WARN] causal-conv1d 编译超时/失败，fla 回退纯 Triton 路径（较慢但可用）"
+# ⚠ 09-28：不装 flash-attn。torch 2.10+cu128 太新，PyPI 没有匹配的预编译轮子
+# （sft env 能用固定版本 2.7.4.post1 是因为那边钉的是 torch 2.6+cu124），pip 会
+# 尝试本地源码编译——实测在 koala 上把 setup 任务卡死 20+ 分钟且无输出，疑似
+# 编译内存不足。verl-c4 已证明本仓的 attn 组合是 fla（线性注意力层，独立于
+# flash-attn）+ 全注意力层走 sdpa 也没问题（colocate-p2 的 V4 就是这样跑的），
+# 且这里的序列是单图短 prompt（非训练侧 30 帧长历史），sdpa 没有 O(N^2) 顾虑。
+# fsdp_workers.py 的 attn_implementation 已改为读 model.attn_implementation
+# （默认 sdpa，见 ppo_trainer.yaml），因此训练侧压根不需要装它。
 
 echo "[setup] ③ verl-agent 训练侧依赖"
 pip install -e rl_train/verl_agent/ --no-deps -q

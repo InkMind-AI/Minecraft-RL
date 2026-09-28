@@ -207,7 +207,11 @@ class ActorRolloutRefWorker(Worker):
             torch_dtype = PrecisionType.to_dtype(torch_dtype)
 
         # override model kwargs
-        actor_model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code, attn_implementation="flash_attention_2")
+        # 09-28：attn_implementation 从硬编码 flash_attention_2 改为可配（默认 sdpa，
+        # 见 ppo_trainer.yaml model.attn_implementation 的注释）。
+        actor_model_config = AutoConfig.from_pretrained(
+            local_path, trust_remote_code=trust_remote_code,
+            attn_implementation=self.config.model.get("attn_implementation", "flash_attention_2"))
                 
         # patch for kimi-vl
         if getattr(actor_model_config, "model_type", None) == "kimi_vl":

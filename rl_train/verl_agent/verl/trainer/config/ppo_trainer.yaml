@@ -40,6 +40,12 @@ actor_rollout_ref:
     use_liger: False
     use_fused_kernels: False
     trust_remote_code: False
+    # 09-28 新增：原先硬编码 flash_attention_2（fsdp_workers.py）。torch 2.10+cu128
+    # 尚无预编译轮子，从源码编译的 flash-attn 在 koala 上把 setup 任务拖死
+    # （verl-setup-trainenv1 卡 20+ 分钟无输出）。verl-c4 已证明 fla（线性注意力，
+    # 独立于 flash-attn）+ sdpa（8/32 全注意力层）在真实 9B 权重上没问题；这里
+    # 单图短序列（非 30 帧长历史）用 sdpa 更没有 O(N^2) 顾虑，改默认为 sdpa。
+    attn_implementation: sdpa
   actor:
     strategy: fsdp  # [fsdp, fsdp2], This is for backward-compatibility
     ppo_mini_batch_size: 256
