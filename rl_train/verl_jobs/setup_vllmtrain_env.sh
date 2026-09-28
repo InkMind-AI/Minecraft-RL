@@ -75,6 +75,16 @@ _install_missing_no_deps() {
             pip install -q --no-deps --upgrade "$mod" 2>&1 | tail -2
             continue
         fi
+        # transformers 内部版本门禁："X>=A,<B is required ... but found X==C"——
+        # 上面盲目 --upgrade 到最新版会撞这个（huggingface_hub 2.0.0 比 5.15.0
+        # 要求的 <2.0 还新）。直接把报错里的版本约束原样递给 pip，钉到兼容区间。
+        local spec
+        spec="$(echo "$out" | grep -oE "[A-Za-z0-9_.-]+[<>=,.0-9]+ is required" | head -1 | sed 's/ is required//')"
+        if [ -n "$spec" ]; then
+            echo "[setup] 按版本门禁钉版本: $spec（--no-deps）"
+            pip install -q --no-deps "$spec" 2>&1 | tail -2
+            continue
+        fi
         echo "[setup][WARN] 无法识别的错误，放弃重试: $out"
         return 1
     done
