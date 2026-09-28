@@ -25,6 +25,11 @@ source /opt/conda/etc/profile.d/conda.sh
 REPO_ROOT="${REPO_ROOT:-/data/work/run_codes/Minecraft-CoT}"
 cd "$REPO_ROOT"
 
+if ! command -v xvfb-run >/dev/null 2>&1; then
+    echo "[setup] installing xvfb (needed later for the real Malmo boot check)"
+    apt-get install -y -qq xvfb >/dev/null 2>&1
+fi
+
 if ! conda env list | grep -qE '^vllm35 '; then
   conda create -n vllm35 python=3.11 -y >/dev/null 2>&1
   conda activate vllm35 && pip install -q --no-cache-dir 'vllm==0.17.0' && conda deactivate
@@ -77,9 +82,10 @@ declare -A _PIP_NAME_MAP=(
 )
 _install_missing_no_deps() {
     local probe="$1"
+    local runner="${2:-python}"  # 默认直接跑；传 "xvfb-run -a python" 给需要显示的探针
     for _ in $(seq 1 20); do
         local out rc
-        out="$(python -c "$probe" 2>&1)"; rc=$?
+        out="$($runner -c "$probe" 2>&1)"; rc=$?
         if [ "$rc" -eq 0 ]; then return 0; fi
         local mod
         mod="$(echo "$out" | grep -oE "No module named '[^']+'" | head -1 | sed "s/No module named '//;s/'//" | cut -d. -f1)"
@@ -208,7 +214,27 @@ os.remove(os.path.join(d, 'engine.zip'))
 fi
 unset -f _engine_ok
 
-echo "[setup] ⑤ 逐个验证 import"
+# ⚠ 09-28：Pyro4/xmltodict 这类依赖只在**真正启动一个 Malmo/JVM 实例**时才会
+# 被 import（minerl 的 Java 通信桥接层），任何静态 import 链探针都探不到——
+# trainenv10→12 连续三轮各自在这里踩出一个新缺口（先 Pyro4 后 xmltodict），
+# 每轮都要等一次完整 15+ 分钟的 job 往返才能看到下一个。与其继续被动挨个撞，
+# 这里直接真实起一次 Malmo（xvfb-run 提供显示；引擎/JVM 此刻均已就绪），让补丁
+# 循环在 setup 阶段内部把这条运行时依赖链一次性走完。跑一次基本的 mine_block
+# 任务 reset+close（不 step，避免额外拉长冒烟时间），失败信息交给
+# _install_missing_no_deps 复用同一套仓库判定+修复逻辑。
+echo "[setup] ⑤ 真实起一次 Malmo（捕获仅运行时触发的依赖，如 Pyro4/xmltodict）"
+_install_missing_no_deps "
+from openagents.envs.tasks.task_manager import choose_available_task
+from agent_system.environments.env_package.minecraft.envs import _build_sim
+cfg = choose_available_task('mine_block:oak_log', difficulty='easy')
+sim = _build_sim(cfg, record_path=None)
+sim.reset()
+sim.close()
+print('MALMO_BOOT_OK')
+" "xvfb-run -a python"
+_assert_torch_unchanged "⑤真实Malmo冒烟"
+
+echo "[setup] ⑥ 逐个验证 import"
 python - <<'PY'
 mods = ["torch", "transformers", "vllm", "verl", "agent_system", "gigpo",
         "ray", "omegaconf", "gym", "minestudio", "openagents", "cv2", "numpy"]
@@ -230,7 +256,7 @@ import sys
 sys.exit(0 if ok else 1)
 PY
 IMPORT_CHECK_RC=$?
-_assert_torch_unchanged "⑤最终验证"
+_assert_torch_unchanged "⑥最终验证"
 
 echo "[setup] vllmtrain env ready: java=$(command -v java || echo MISSING)"
 if [ "$IMPORT_CHECK_RC" -ne 0 ]; then
