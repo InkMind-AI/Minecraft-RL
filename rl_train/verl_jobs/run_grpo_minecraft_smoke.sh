@@ -5,7 +5,12 @@
 # 关键对齐点（否则会重演 iter1 的分布偏移）：
 #   - apply_chat_template_kwargs.enable_thinking=false —— 与 SFT/评测的
 #     _CHAT_TEMPLATE_KWARGS 完全一致（chat_template.jinja 里 enable_thinking=false
-#     时才会吐出 "<think>\n\n</think>\n\n" 空推理块）
+#     时才会吐出 "<think>\n\n</think>\n\n" 空推理块）。用 `+` 前缀（而非
+#     `data.apply_chat_template_kwargs={...}` 整体替换）：Hydra struct 模式下，
+#     即使是给一个空字典 `{}` 赋新的字面量值，也会按"合并"语义逐键校验，
+#     `enable_thinking` 这个键不在原 schema 里就直接拒绝（"Key ... is not in
+#     struct"）——09-28 grpo-smoke1 实测踩到，`+` 前缀是 Hydra 自己在报错里
+#     建议的写法：显式声明"这是新增键"而非覆盖已有键。
 #   - env.minecraft.system_message_tag=text_action —— 与评测 SYSTEM_MESSAGE_TAG 一致
 #   - actor_rollout_ref.model.path 用 continue-SFT 起点（v2-e4），不是原始基座
 #
@@ -38,7 +43,7 @@ python3 -m verl.trainer.main_ppo \
     data.truncation='error' \
     data.image_key=images \
     data.return_raw_chat=True \
-    'data.apply_chat_template_kwargs={enable_thinking: false}' \
+    +data.apply_chat_template_kwargs.enable_thinking=false \
     actor_rollout_ref.model.path="$MODEL_PATH" \
     actor_rollout_ref.model.trust_remote_code=True \
     actor_rollout_ref.actor.optim.lr=1e-6 \
