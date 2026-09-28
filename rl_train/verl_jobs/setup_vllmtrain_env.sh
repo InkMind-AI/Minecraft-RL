@@ -149,8 +149,16 @@ _assert_torch_unchanged "②fla/causal-conv1d"
 echo "[setup] ③ verl-agent 训练侧依赖（--no-deps）"
 pip install -e rl_train/verl_agent/ --no-deps -q
 pip install -q --no-deps accelerate codetiming datasets dill pandas peft pylatexenc 'ray[default]' \
-  'tensordict>=0.8.0,<=0.10.0,!=0.9.0' torchdata wandb qwen-vl-utils pybind11 omegaconf hydra-core gym
+  'tensordict>=0.8.0,<=0.10.0,!=0.9.0' torchdata wandb qwen-vl-utils pybind11 omegaconf hydra-core gym \
+  pyarrow multiprocess
 _install_missing_no_deps "import verl, agent_system, gigpo"
+# ⚠ 09-28：`import verl` / `agent_system` 本身很浅——真正的训练入口
+# `verl.trainer.main_ppo` 会往下拉一条完全不同的深链（ray_trainer.py ->
+# multi_turn_rollout -> verl.utils.dataset.rl_dataset -> `import datasets` ->
+# HF datasets 内部用 `multiprocess`），首次 GRPO 冒烟才在这里连环炸出
+# pyarrow（pandas.to_parquet 引擎）和 multiprocess 两个缺口。不会 `main()`
+# 副作用（`if __name__ == "__main__"` 守卫），可以放心 import 探测。
+_install_missing_no_deps "import verl.trainer.main_ppo"
 # omegaconf/hydra-core 用 ANTLR4 解析插值语法（`from antlr4 import ...`），但只在
 # 真正解析带 `${...}` 插值的配置时才触发 import，`import omegaconf` 本身不会
 # 暴露这个缺口——09-28 实测：step③ 探针全绿，直到 step⑤ 最终验证才 FAIL。
