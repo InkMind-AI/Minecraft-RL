@@ -45,19 +45,38 @@ _assert_torch_unchanged() {
         exit 1
     fi
 }
-# 逐个补最小依赖：--no-deps 装的包 import 报 ModuleNotFoundError 时，只装那个
-# 缺失模块本身（同样 --no-deps），绝不让 resolver 联带升降级 torch 系。最多试
-# 8 轮（每轮最多补一个新缺失模块，链式缺失逐层剥开）。
+# 逐个补最小依赖，同样全程 --no-deps（绝不让 resolver 联带升降级 torch 系）。
+# 用退出码判定成功/失败，而不是"有无 stderr 输出"——import 时的
+# DeprecationWarning/FutureWarning 会打到 stderr 但退出码是 0，之前用
+# `[ -z "$err" ]` 误判过一次（transformers 5.15 的一条无害警告被当成失败）。
+# 覆盖两种缺陷形态：
+#   ① ModuleNotFoundError: No module named 'X'      -> 装 X
+#   ② ImportError: cannot import name '...' from 'X' -> **升级** X（--no-deps
+#      装的新版包往往需要更新版本的间接依赖才有新符号，如 transformers 5.15
+#      需要更新的 huggingface_hub 才有 is_offline_mode；простое install 不生效，
+#      必须 --upgrade）
+# 最多试 8 轮，每轮最多处理一个新缺陷，链式缺失逐层剥开。
 _install_missing_no_deps() {
     local probe="$1"
     for _ in 1 2 3 4 5 6 7 8; do
-        local err; err="$(python -c "$probe" 2>&1)"
-        if [ -z "$err" ]; then return 0; fi
+        local out rc
+        out="$(python -c "$probe" 2>&1)"; rc=$?
+        if [ "$rc" -eq 0 ]; then return 0; fi
         local mod
-        mod="$(echo "$err" | grep -oE "No module named '[^']+'" | head -1 | sed "s/No module named '//;s/'//" | cut -d. -f1)"
-        if [ -z "$mod" ]; then echo "[setup][WARN] 非缺模块错误，放弃重试: $err"; return 1; fi
-        echo "[setup] 补装 $mod（--no-deps）"
-        pip install -q --no-deps "$mod" 2>&1 | tail -2
+        mod="$(echo "$out" | grep -oE "No module named '[^']+'" | head -1 | sed "s/No module named '//;s/'//" | cut -d. -f1)"
+        if [ -n "$mod" ]; then
+            echo "[setup] 补装 $mod（--no-deps）"
+            pip install -q --no-deps "$mod" 2>&1 | tail -2
+            continue
+        fi
+        mod="$(echo "$out" | grep -oE "cannot import name '[^']+' from '[^']+'" | head -1 | sed -E "s/.*from '([^']+)'/\1/" | cut -d. -f1)"
+        if [ -n "$mod" ]; then
+            echo "[setup] 升级 $mod（--no-deps --upgrade，缺符号）"
+            pip install -q --no-deps --upgrade "$mod" 2>&1 | tail -2
+            continue
+        fi
+        echo "[setup][WARN] 无法识别的错误，放弃重试: $out"
+        return 1
     done
     echo "[setup][WARN] 多次重试后仍失败: $probe"
     return 1
