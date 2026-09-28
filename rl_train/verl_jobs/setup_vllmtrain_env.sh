@@ -153,10 +153,14 @@ echo "[setup] ④ openagents（--no-deps）+ minestudio（--no-deps + 逐个补�
 pip install -e . --no-deps -q
 pip install -q --no-deps minestudio
 # ⚠ 探针必须探到真正会被调用的深层路径，不能只 `import minestudio`：
-# minestudio/__init__.py 本身很浅、不会触发 minestudio.utils.register，但下面
-# 的 engine 检查要用 get_mine_studio_dir（在 utils/register.py 里 `from absl
-# import logging`）——09-28 实测浅探针放行后，深层 import 没人补依赖，直接在
-# engine 检查那一步裸崩。用与 _engine_ok 完全相同的导入语句做探针。
+# minestudio/__init__.py 本身很浅，不会触发它自己的子模块树（utils.register
+# 需要 absl；utils.vpt_lib.actions 经 action_head 需要 gymnasium，这两条都是
+# 09-28 分别实测踩到的独立缺口——`import minestudio` 和 `get_mine_studio_dir`
+# 都不经过 vpt_lib）。与其继续追加零散子路径，直接用 smoke_step2.py 自己会跑
+# 的**完整导入链**做探针：openagents.agents.utils.action_mapping（经
+# minestudio.utils.vpt_lib）+ minecraft env 包本身，这样任何这条链上的新缺口
+# 都会在 setup 阶段暴露，而不是留到 Malmo 冒烟才炸。
+_install_missing_no_deps "from agent_system.environments.env_package.minecraft import build_minecraft_envs, minecraft_projection"
 _install_missing_no_deps "from minestudio.utils import get_mine_studio_dir"
 _assert_torch_unchanged "④minestudio"
 
