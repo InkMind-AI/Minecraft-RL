@@ -53,9 +53,19 @@ _assert_torch_unchanged() {
 #   ① ModuleNotFoundError: No module named 'X'      -> 装 X
 #   ② ImportError: cannot import name '...' from 'X' -> **升级** X（--no-deps
 #      装的新版包往往需要更新版本的间接依赖才有新符号，如 transformers 5.15
-#      需要更新的 huggingface_hub 才有 is_offline_mode；простое install 不生效，
+#      需要更新的 huggingface_hub 才有 is_offline_mode；普通 install 不生效，
 #      必须 --upgrade）
+#   ③ 版本门禁 "X>=A,<B is required ... but found X==C" -> 钉版本区间
 # 最多试 8 轮，每轮最多处理一个新缺陷，链式缺失逐层剥开。
+#
+# ⚠ 导入名 ≠ PyPI 包名的情况（`pip install $mod` 会装错包或直接 404）：
+# 09-28 实测 dateutil（PyPI 是 python-dateutil）连续 8 轮无效才发现。这里只维护
+# 一张已知小表，遇到新的照此模式继续加。
+declare -A _PIP_NAME_MAP=(
+    [dateutil]=python-dateutil [yaml]=PyYAML [PIL]=Pillow [cv2]=opencv-python
+    [sklearn]=scikit-learn [absl]=absl-py [google]=protobuf [jwt]=PyJWT
+    [Crypto]=pycryptodome [OpenSSL]=pyOpenSSL [dotenv]=python-dotenv
+)
 _install_missing_no_deps() {
     local probe="$1"
     for _ in 1 2 3 4 5 6 7 8; do
@@ -65,8 +75,9 @@ _install_missing_no_deps() {
         local mod
         mod="$(echo "$out" | grep -oE "No module named '[^']+'" | head -1 | sed "s/No module named '//;s/'//" | cut -d. -f1)"
         if [ -n "$mod" ]; then
-            echo "[setup] 补装 $mod（--no-deps）"
-            pip install -q --no-deps "$mod" 2>&1 | tail -2
+            local pkg="${_PIP_NAME_MAP[$mod]:-$mod}"
+            echo "[setup] 补装 $mod（pip 包名 $pkg，--no-deps）"
+            pip install -q --no-deps "$pkg" 2>&1 | tail -2
             continue
         fi
         mod="$(echo "$out" | grep -oE "cannot import name '[^']+' from '[^']+'" | head -1 | sed -E "s/.*from '([^']+)'/\1/" | cut -d. -f1)"
@@ -130,7 +141,12 @@ _assert_torch_unchanged "③verl训练依赖"
 echo "[setup] ④ openagents（--no-deps）+ minestudio（--no-deps + 逐个补依赖）"
 pip install -e . --no-deps -q
 pip install -q --no-deps minestudio
-_install_missing_no_deps "import minestudio"
+# ⚠ 探针必须探到真正会被调用的深层路径，不能只 `import minestudio`：
+# minestudio/__init__.py 本身很浅、不会触发 minestudio.utils.register，但下面
+# 的 engine 检查要用 get_mine_studio_dir（在 utils/register.py 里 `from absl
+# import logging`）——09-28 实测浅探针放行后，深层 import 没人补依赖，直接在
+# engine 检查那一步裸崩。用与 _engine_ok 完全相同的导入语句做探针。
+_install_missing_no_deps "from minestudio.utils import get_mine_studio_dir"
 _assert_torch_unchanged "④minestudio"
 
 if ! command -v java >/dev/null 2>&1; then
