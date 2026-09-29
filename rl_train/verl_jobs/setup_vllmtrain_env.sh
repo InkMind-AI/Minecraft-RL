@@ -150,8 +150,12 @@ echo "[setup] ③ verl-agent 训练侧依赖（--no-deps）"
 pip install -e rl_train/verl_agent/ --no-deps -q
 pip install -q --no-deps accelerate codetiming datasets dill pandas peft pylatexenc 'ray[default]' \
   'tensordict>=0.8.0,<=0.10.0,!=0.9.0' torchdata wandb qwen-vl-utils pybind11 omegaconf hydra-core gym \
-  pyarrow multiprocess
+  pyarrow multiprocess einops
 _install_missing_no_deps "import verl, agent_system, gigpo"
+# dp_actor.py 顶层无条件 `from flash_attn.bert_padding import ...`（与
+# attn_implementation 无关，纯 pad/unpad 工具函数）——已在源码里加了不装
+# flash-attn 时的纯 PyTorch 兜底（用 einops.rearrange），这里探一下确认能 import。
+_install_missing_no_deps "import verl.workers.actor.dp_actor"
 # ⚠ 09-28：`import verl` / `agent_system` 本身很浅——真正的训练入口
 # `verl.trainer.main_ppo` 会往下拉一条完全不同的深链（ray_trainer.py ->
 # multi_turn_rollout -> verl.utils.dataset.rl_dataset -> `import datasets` ->

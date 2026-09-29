@@ -40,7 +40,44 @@ from verl.utils.ulysses import gather_outpus_and_unpad, ulysses_pad_and_slice_in
 from verl.workers.actor import BasePPOActor
 
 if is_cuda_available:
-    from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+    # 09-29：这个 import 与 attn_implementation 无关——flash_attn.bert_padding
+    # 只是 verl 借来做变长序列 pad/unpad 的工具函数集，纯 CPU/GPU 张量操作，跟
+    # 注意力核函数本身无关。但它无条件挂在模块顶层，即便 `use_remove_padding=
+    # False`（下面唯一用到这几个符号的分支被跳过）也照样在 import 阶段炸掉。
+    # colocate-p2/verl-c4 已确认本仓不装 flash-attn（torch2.10+cu128 无预编译
+    # 轮子，源码编译在 koala 上把 setup 卡死 20+ 分钟）——因此在这里做同一份
+    # 纯 PyTorch 兜底实现，装到了就用原版（真正走 use_remove_padding=True 时
+    # 性能更好），没装就退回等价的慢路径，两者行为一致。
+    try:
+        from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+    except ImportError:
+        from einops import rearrange
+
+        def unpad_input(hidden_states, attention_mask):
+            """flash_attn.bert_padding.unpad_input 的纯 PyTorch 等价实现。
+
+            hidden_states: (batch, seqlen, ...)；attention_mask: (batch, seqlen)
+            返回 (压紧后的 (total_nnz, ...), 有效位置在展平 (batch*seqlen,) 中的
+            下标, cu_seqlens, max_seqlen_in_batch) —— 与原版签名/返回值形状一致。
+            """
+            seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
+            indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
+            max_seqlen_in_batch = int(seqlens_in_batch.max().item()) if seqlens_in_batch.numel() else 0
+            cu_seqlens = torch.nn.functional.pad(
+                torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0))
+            flat = hidden_states.reshape(-1, *hidden_states.shape[2:])
+            return flat[indices], indices, cu_seqlens, max_seqlen_in_batch
+
+        def pad_input(hidden_states, indices, batch, seqlen):
+            """flash_attn.bert_padding.pad_input 的纯 PyTorch 等价实现。"""
+            out = torch.zeros(
+                batch * seqlen, *hidden_states.shape[1:],
+                dtype=hidden_states.dtype, device=hidden_states.device)
+            out[indices] = hidden_states
+            return out.reshape(batch, seqlen, *hidden_states.shape[1:])
+
+        def index_first_axis(hidden_states, indices):
+            return hidden_states[indices]
 elif is_npu_available:
     from transformers.integrations.npu_flash_attention import index_first_axis, pad_input, rearrange, unpad_input
 
