@@ -23,9 +23,12 @@ cd "$REPO_ROOT"
 MODEL_PATH="${MODEL_PATH:-/local-ssd/model_cache}"
 DATA_DIR="${DATA_DIR:-/local-ssd/verl_data}"
 GROUP_SIZE="${GROUP_SIZE:-4}"
-TRAIN_BATCH="${TRAIN_BATCH:-1}"        # = 任务组数；总 worker 数 = TRAIN_BATCH*GROUP_SIZE
-MAX_STEPS_ENV="${MAX_STEPS_ENV:-16}"   # 冒烟用短 episode，缩短 rollout 耗时
 N_GPUS="${N_GPUS:-2}"
+# ⚠ 09-29：verl 断言 `real_train_batch_size % n_gpus == 0`（rollout batch 要能
+# 均分到各 GPU）。TRAIN_BATCH（任务组数）默认与 N_GPUS 对齐，而非固定 1——
+# grpo-smoke3 实测 TRAIN_BATCH=1 + N_GPUS=2 直接在训练循环起步前断言失败退出。
+TRAIN_BATCH="${TRAIN_BATCH:-$N_GPUS}"  # = 任务组数；总 worker 数 = TRAIN_BATCH*GROUP_SIZE
+MAX_STEPS_ENV="${MAX_STEPS_ENV:-16}"   # 冒烟用短 episode，缩短 rollout 耗时
 TASKS="${TASKS:-mine_block:oak_log}"
 
 python rl_train/verl_jobs/prepare_minecraft_data.py --out "$DATA_DIR" \
