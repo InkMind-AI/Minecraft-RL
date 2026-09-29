@@ -11,7 +11,7 @@
 | **1. 适配器** | verl-agent + qwen3_5 模型后端，真实 9B 权重前向 | ✅ 通过（`verl-c4`，09-27） |
 | **2. 环境接入** | Minecraft/Malmo 环境包 + `MinecraftEnvironmentManager` | ✅ 通过（`verl-env-d5`，09-28） |
 | **2.5 训练/推理共存可行性** | HF 训练 + vLLM 推理能否同进程、权重能否同步 | ✅ 可行（`colocate-p2`，09-28） |
-| **3. GRPO 训练启动** | `verl.trainer.main_ppo` 端到端跑通 rollout→advantage→update | ⏳ 调试中（`grpo-smoke1`→`smoke6`，09-28~09-29，六轮修复） |
+| **3. GRPO 训练启动** | `verl.trainer.main_ppo` 端到端跑通 rollout→advantage→update | ⏳ 调试中（`grpo-smoke1`→`smoke9`，09-28~09-29，7 个根因已修，`smoke9` 排队中） |
 | **4. 端到端训练 + 吞吐** | ≥2 个 update step 完整跑通；吞吐/GPU 利用率对比自研线 | ❌ 尚未开始 |
 
 ---
@@ -184,15 +184,17 @@ Pyro4/xmltodict) → ⑥ 逐个 import 复核），是在多轮实测中被迫�
 | `smoke4` | `ModuleNotFoundError: No module named 'flash_attn'`（发生在 `ref_init_model`） | `verl/workers/actor/dp_actor.py` 模块**顶层**无条件 `from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input`——这与 `attn_implementation` 无关（纯 pad/unpad 工具函数），且即使 `use_remove_padding=False`（唯一会调用这几个符号的分支被跳过）也照样在 import 阶段炸 | 加 try/except，无 flash_attn 时用纯 PyTorch 等价实现（已用本地单测验证 unpad→pad 往返一致、`cu_seqlens` 正确、`index_first_axis` 语义正确） |
 | `smoke5` | `ImportError: cannot import name 'AutoModelForVision2Seq' from 'transformers'` | transformers 5.x 把 `AutoModelForVision2Seq` 重命名/合并进了 `AutoModelForImageTextToText`（`fsdp_workers.py` 和 `fsdp_checkpoint_manager.py` 两处硬编码旧名） | 两处都加 try/except 别名兜底 |
 | `smoke6` | **首次跑过全部 setup**（fla/minestudio/真实 Malmo 冒烟全绿），到达 vLLM engine 初始化才报错：`pydantic ValidationError: Chunked prefill is required for mamba cache mode 'align'` | Qwen3.5 的 fla 混合注意力（mamba/gated-delta-net cache）在当前 vLLM 版本下要求 chunked prefill 开启，脚本里写死了 `enable_chunked_prefill=False` | 改为 `True` |
-| `smoke7` | ⏳ 已提交，核实入队（`.koala-logs/axiomjin-verl-grpo-smoke7-*` 存在） | — | — |
+| `smoke7` | `setup_vllmtrain_env.sh` 装完 openjdk 立即退出：`JAVA_HOME_CONDA_BACKUP: unbound variable` | openjdk 的 conda 钩子（`deactivate.d/openjdk_deactivate.sh`）不兼容 `set -u`；这个坑此前只在 `setup_openha_env.sh` 里修过，新脚本漏搬同一处防护（间歇性——同一脚本在 `smoke6` 那次没触发） | 装 openjdk 前后临时关/开 `set -u`（第一版局部修法） |
+| `smoke8` | **setup 完整跑完**（`SETUP_VLLMTRAIN_DONE` 打印），但 job 脚本自己**多余的第二次** `conda activate vllmtrain` 又炸：`activate.d/openjdk_activate.sh: target_platform: unbound variable` | 同一类坑的第二次复现：`smoke7` 的局部修法只在"安装那一刻"关 `set -u`，装完立刻恢复，治不了脚本 source 结束后、调用方自己再 activate 一次的场景 | 精简 job 脚本去掉重复 activate；同时把 setup 脚本的修法从"局部关闭"改为"检查 java 之前关闭、之后不再恢复"，一次性兜住所有后续 activate/deactivate |
+| `smoke9` | ⏳ 已提交，`Queuing #11`（集群排队，尚未开始执行） | — | — |
 
-前 6 轮修复均已提交并同步到 S3；每轮都是"改代码 → 语法检查 → 提交 → 用 S3
-日志目录核实真的入队 → 拉日志定位下一个问题"的循环，累计暴露 6 个独立、
-互不相关的兼容性问题（全部是 verl-agent/openagents/transformers/vLLM 版本演进
-导致，不是设计缺陷）。**`smoke6` 是一个重要里程碑**：环境组装脚本（fla 内核、
-minestudio、真实起一次 Malmo）第一次完整走完不再报错，问题域已经从"环境能不能
-装起来"收窄到"verl 训练配置参数是否与 Qwen3.5 + 当前 vLLM 版本兼容"，后者
-出坑频率明显低于前者。
+前 8 轮修复均已提交并同步到 S3；每轮都是"改代码 → 语法检查 → 提交 → 用 S3
+日志目录核实真的入队 → 拉日志定位下一个问题"的循环，累计暴露 7 个独立
+根因（6 个环境/框架兼容性问题 + openjdk 的 `set -u` 坑复现两次）。**`smoke6`
+是重要里程碑**：环境组装（fla 内核、minestudio、真实起一次 Malmo）第一次
+完整走完不再报错，问题域已从"环境能不能装起来"收窄到"训练配置/收尾细节"。
+`smoke7`/`smoke8` 是同一个 openjdk 坑的两次不同触发路径，已改为从根上
+（不恢复 `set -u`）解决，理论上不会再犯第三次。
 
 ---
 
@@ -210,11 +212,26 @@ minestudio、真实起一次 Malmo）第一次完整走完不再报错，问题�
 5. **版本演进导致的 API 改名**（`AutoModelForVision2Seq` →
    `AutoModelForImageTextToText`）需要用 try/except 做双向兼容，而不是
    非此即彼地升级或钉住版本
+6. **`source` 脚本改的 shell 选项会持续影响调用方后续代码**：局部关闭/
+   重新开启某个选项（如 `set -u`）只能兜住"这一刻"，若调用方后面还有
+   代码路径会触发同一类不兼容操作（如再调一次 `conda activate`），必须
+   在 sourced 脚本里"从此不再恢复"才能彻底兜住，不能只治第一次触发点
+
+## 当前状态（09-29 深夜）
+
+`smoke9`（本轮修复后的版本）已提交、确认入队，但排在集群队列 **#11 位**，
+截至最后一次检查已等待 11m51s 仍未开始执行——这是纯粹的集群资源排队，
+不是代码问题。一旦真正开始跑，理论上应该：沿用 `smoke6` 已验证过的 setup
+路径（fla/minestudio/Malmo 全部装好）→ 用 `smoke6` 定位到的
+`enable_chunked_prefill=True` 修复过 vLLM engine 初始化 → 用本轮修复过的
+openjdk 处理不再被 `set -u` 挡住 → 第一次真正进入 GRPO 训练循环
+（rollout → advantage → update）。
 
 ## 下一步
 
-1. 让 `grpo-smoke6` 跑完，若仍有新报错继续按同样流程修
-2. 跑通后，扩大到真正的小规模训练（≥2 个 update step，非冒烟规模）
+1. 等 `smoke9` 排队结束并跑完，若仍有新报错继续按同样流程修（不确定是否
+   还有第 8 个坑，但训练循环本身是全新代码路径，仍需实际跑一次才能确认）
+2. 跑通冒烟后，扩大到真正的小规模训练（≥2 个 update step，非冒烟规模）
 3. 测吞吐/GPU 利用率，对比自研线（HTTP eval-harness rollout）——这是切换
    决策的核心指标，目前仍是空白
 4. 解决"每样本单图 vs h29 多图历史"的结构性差距，否则 verl 线产出的策略
