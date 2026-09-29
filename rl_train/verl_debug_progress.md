@@ -217,28 +217,57 @@ Pyro4/xmltodict) → ⑥ 逐个 import 复核），是在多轮实测中被迫�
    代码路径会触发同一类不兼容操作（如再调一次 `conda activate`），必须
    在 sourced 脚本里"从此不再恢复"才能彻底兜住，不能只治第一次触发点
 
-## 当前状态（09-30 更新）
+## 当前状态（09-30，被集群基础设施问题阻塞）
 
-`smoke9`（本轮修复后的版本）已提交、确认入队，但排在集群队列 **#11 位**，
-截至最后一次检查已等待 **47 分钟**仍未开始执行、队列位次未变——这是纯粹的
-集群资源排队，不是代码问题。一旦真正开始跑，理论上应该：沿用 `smoke6`
-已验证过的 setup 路径（fla/minestudio/Malmo 全部装好）→ 用 `smoke6` 定位到的
-`enable_chunked_prefill=True` 修复过 vLLM engine 初始化 → 用本轮修复过的
-openjdk 处理不再被 `set -u` 挡住 → 第一次真正进入 GRPO 训练循环
-（rollout → advantage → update）。
+`smoke9` 因 CLI 升级后 `--s3-log` 被移除而失败提交（见下），改用 `smoke10`
+（1 GPU，去掉 `--s3-log`）重新提交，**已排队 2.5h+，队列位次 #21→#19→#15
+后停滞不动**——这是集群本身资源紧张，不是代码或配额问题（配额 32 卡仅用 1-2，
+远未打满）。
 
-⚠️ **koala CLI 已升级 2.3.6 → 2.4.0**：默认集群改为 H20，此前用的 AWS 集群
-需显式加 `--cluster aws`（否则 `koala ls` 看不到 `smoke9`，会误判"队列已空"）。
+**已排除的绕行方案**：
+
+1. **迁移到 H20 集群**（完全空闲，32 卡可用、队列为空）——探针任务提交后
+   卡在 `ContainerCreating` 超过 5 分钟未起（诊断直接提示"节点故障"），大概率
+   是阿里云节点拉 AWS ECR 镜像跨云失败/极慢。**代码和模型权重都在 AWS S3，
+   短期内不具备迁移 H20 的条件**
+2. **改用 debug 模式 + `koala exec`/`koala ssh` 交互式跑**——debug 配额是独立
+   并发池，提交后立即 `Running`（不受 normal 队列排队影响），但 `koala ssh
+   --connect` / `koala exec` 反复重试 40 次后必然报
+   `Connection aborted: RemoteDisconnected`。排查过程：
+   - `ssh cvm`（跳板机第一跳）直连测试**成功**——网络本身通
+   - `~/.ssh/config` 里 `Host koala` 只有 `ProxyJump cvm`，缺 `HostName`——
+     说明"cvm → pod"这一跳的隧道建立步骤从未成功写回配置
+   - `koala get` 确认 pod 本身 `Running`（k8s/MPIJob 状态正常，命令是占位的
+     `sleep 8h`）——**pod 健康，问题在 cvm 到 pod 的隧道/端口转发这一层**，
+     是基础设施问题，非本地配置或代码可修
+   - 已删除该 debug pod 释放配额（`koala exec` 交互式调试这条路当前**不可用**）
+
+一旦 `smoke10` 真正开始跑，理论上应该：沿用 `smoke6` 已验证过的 setup 路径
+（fla/minestudio/Malmo 全部装好）→ 用 `smoke6` 定位到的
+`enable_chunked_prefill=True` 修复过 vLLM engine 初始化 → 用 `smoke7`/`smoke8`
+修复过的 openjdk `set -u` 问题 → 第一次真正进入 GRPO 训练循环
+（rollout → advantage → update）。**修复本身没有新问题，纯粹卡在排队。**
+
+⚠️ **koala CLI 已升级 2.3.6 → 2.4.0，带来两处不兼容**：
+1. 默认集群改为 H20，AWS 集群需显式加 `--cluster aws`（否则 `koala ls`
+   看不到任务，会误判"队列已空"）
+2. **`--s3-log` 参数已被移除**（"仅支持平台保留的 Pod 日志"），此前全程依赖的
+   "`--s3-log` 提交 + `aws s3 cp .koala-logs/...` 拉日志"这套流程**不再可用**，
+   改用 `koala logs <job> --cluster aws --all`（任务结束后日志是否仍可查还
+   需要验证——`.koala-logs` 这条路径已知失效，后续必须切到 `koala logs`）
+
 H20 集群的路径/存储约定也变了（个人持久目录 `/cpfs/<企业ID>`，代码走东京
-OSS），**目前的任务全部提交在 AWS 集群，暂不需要迁移**，但后续所有
-`koala` 命令都要记得带 `--cluster aws`，否则会漏看/漏提交任务。
+OSS）——只有在真正决定迁移 H20 时才需要处理，目前不适用。
 
 ## 下一步
 
-1. 等 `smoke9` 排队结束并跑完，若仍有新报错继续按同样流程修（不确定是否
-   还有第 8 个坑，但训练循环本身是全新代码路径，仍需实际跑一次才能确认）
-2. 跑通冒烟后，扩大到真正的小规模训练（≥2 个 update step，非冒烟规模）
-3. 测吞吐/GPU 利用率，对比自研线（HTTP eval-harness rollout）——这是切换
+1. 继续等 `smoke10` 排队（唯一在推进的路径），到号后立即用 `koala logs
+   --cluster aws --all` 拉取结果（新日志方式，不再是 S3 路径）
+2. 若排队持续无进展，可考虑：拆分更小的资源请求（已试 1 GPU，效果有限）、
+   找管理员/工单排查集群拥堵、或排查 `koala ssh`/`exec` 隧道故障是否是
+   全局性问题（值得报给平台方，这样后续能用 debug 模式绕开 normal 排队）
+3. 跑通冒烟后，扩大到真正的小规模训练（≥2 个 update step，非冒烟规模）
+4. 测吞吐/GPU 利用率，对比自研线（HTTP eval-harness rollout）——这是切换
    决策的核心指标，目前仍是空白
-4. 解决"每样本单图 vs h29 多图历史"的结构性差距，否则 verl 线产出的策略
+5. 解决"每样本单图 vs h29 多图历史"的结构性差距，否则 verl 线产出的策略
    与评测条件不一致，无法做公平的成绩对比
