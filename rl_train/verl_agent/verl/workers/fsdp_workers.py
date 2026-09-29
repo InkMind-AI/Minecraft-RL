@@ -185,7 +185,16 @@ class ActorRolloutRefWorker(Worker):
         from torch import optim
         from torch.distributed.fsdp import CPUOffload, MixedPrecision
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-        from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForVision2Seq
+        from transformers import AutoConfig, AutoModelForCausalLM
+        try:
+            from transformers import AutoModelForVision2Seq
+        except ImportError:
+            # 09-29：transformers 5.x 把 AutoModelForVision2Seq 重命名/合并进了
+            # AutoModelForImageTextToText（smoke_step1.py 加载同一份 checkpoint
+            # 时已验证过用这个类名）。别名绑定，下游 `AutoModelForVision2Seq.
+            # _model_mapping` / `actor_module_class = AutoModelForVision2Seq` /
+            # `.from_pretrained(...)` 全部不用改。
+            from transformers import AutoModelForImageTextToText as AutoModelForVision2Seq
 
         from verl.utils.model import get_generation_config, print_model_size, update_model_config
         from verl.utils.torch_dtypes import PrecisionType
