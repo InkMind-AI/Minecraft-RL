@@ -193,7 +193,15 @@ _assert_torch_unchanged "④minestudio"
 
 if ! command -v java >/dev/null 2>&1; then
     echo "[setup] installing openjdk=8"
+    # ⚠ 09-29 smoke7 复现坑 6（此前只在 setup_openha_env.sh 里修过，这个新脚本
+    # 漏搬了同一处防护）：openjdk 包的 conda 钩子
+    # `deactivate.d/openjdk_deactivate.sh` 直接读 `$JAVA_HOME_CONDA_BACKUP`，
+    # 在调用方 `set -euo pipefail` 下（本脚本顶部只 `set +e`，未关 nounset）
+    # 装完 openjdk 立即 `JAVA_HOME_CONDA_BACKUP: unbound variable` 退出。
+    # conda install 期间关掉 nounset，装完立即恢复。
+    set +u
     conda install --channel=conda-forge openjdk=8 -y -q
+    set -u
 fi
 if ! python -c "from cuda import cuda, cudart" >/dev/null 2>&1; then
     pip install -q --no-deps "cuda-python==12.6.2.post1"
