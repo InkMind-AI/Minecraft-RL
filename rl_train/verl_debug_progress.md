@@ -183,12 +183,16 @@ Pyro4/xmltodict) → ⑥ 逐个 import 复核），是在多轮实测中被迫�
 | `smoke3`（续） | `AssertionError: real_train_batch_size (1) must be divisible by total n_gpus (2)` | `TRAIN_BATCH`（任务组数）默认写死 1，与 `N_GPUS=2` 不整除 | `TRAIN_BATCH` 默认改为跟随 `N_GPUS` |
 | `smoke4` | `ModuleNotFoundError: No module named 'flash_attn'`（发生在 `ref_init_model`） | `verl/workers/actor/dp_actor.py` 模块**顶层**无条件 `from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input`——这与 `attn_implementation` 无关（纯 pad/unpad 工具函数），且即使 `use_remove_padding=False`（唯一会调用这几个符号的分支被跳过）也照样在 import 阶段炸 | 加 try/except，无 flash_attn 时用纯 PyTorch 等价实现（已用本地单测验证 unpad→pad 往返一致、`cu_seqlens` 正确、`index_first_axis` 语义正确） |
 | `smoke5` | `ImportError: cannot import name 'AutoModelForVision2Seq' from 'transformers'` | transformers 5.x 把 `AutoModelForVision2Seq` 重命名/合并进了 `AutoModelForImageTextToText`（`fsdp_workers.py` 和 `fsdp_checkpoint_manager.py` 两处硬编码旧名） | 两处都加 try/except 别名兜底 |
-| `smoke6` | ⏳ 提交中（重跑上述 5 个修复后的完整链路） | — | — |
+| `smoke6` | **首次跑过全部 setup**（fla/minestudio/真实 Malmo 冒烟全绿），到达 vLLM engine 初始化才报错：`pydantic ValidationError: Chunked prefill is required for mamba cache mode 'align'` | Qwen3.5 的 fla 混合注意力（mamba/gated-delta-net cache）在当前 vLLM 版本下要求 chunked prefill 开启，脚本里写死了 `enable_chunked_prefill=False` | 改为 `True` |
+| `smoke7` | ⏳ 已提交，核实入队（`.koala-logs/axiomjin-verl-grpo-smoke7-*` 存在） | — | — |
 
-前 5 轮修复均已提交并同步到 S3；每轮都是"改代码 → 语法检查 → 提交 → 用 S3
-日志目录核实真的入队 → 拉日志定位下一个问题"的循环，累计暴露 5 个独立、
-互不相关的兼容性问题（全部是 verl-agent/openagents/transformers 版本演进
-导致，不是设计缺陷）。
+前 6 轮修复均已提交并同步到 S3；每轮都是"改代码 → 语法检查 → 提交 → 用 S3
+日志目录核实真的入队 → 拉日志定位下一个问题"的循环，累计暴露 6 个独立、
+互不相关的兼容性问题（全部是 verl-agent/openagents/transformers/vLLM 版本演进
+导致，不是设计缺陷）。**`smoke6` 是一个重要里程碑**：环境组装脚本（fla 内核、
+minestudio、真实起一次 Malmo）第一次完整走完不再报错，问题域已经从"环境能不能
+装起来"收窄到"verl 训练配置参数是否与 Qwen3.5 + 当前 vLLM 版本兼容"，后者
+出坑频率明显低于前者。
 
 ---
 
