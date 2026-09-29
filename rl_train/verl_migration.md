@@ -125,16 +125,36 @@ def minecraft_reward(frames_count, ...):
    也偶尔抽风返回空。**判定标准一律是 S3 日志目录
    `axiomjin/.koala-logs/<job>-*/` 是否存在**
 
-## 第 2 步（环境接入）验收：进行中
+## 第 2 步（环境接入）验收：✅ 已通过（09-28，`verl-env-d5`）
 
-`smoke_step2.py` 三层：D（projection 解码/非法降级）、E（Ray+Malmo `reset()`）、
-F（`step()` 的 obs/reward/done/info 契约 + 打出 info 键，供 reward 契约对齐）。
+`smoke_step2.py` 四层：D（projection 解码/非法降级）、E（Ray+Malmo `reset()`，
+含"同组共享 task_config"校验）、F（`step()` 的 obs/reward/done/info 契约）、
+G（`MinecraftEnvironmentManager`，verl 训练真正调用的入口）。
+
+原先"已注册"的 minecraft 分支从未真正跑过一步（7 个致命 bug：import 断裂 /
+调用契约不符 / 无限重试挂死 / reset 平均白等 90s / KeyError / Ray worker 里
+留 breakpoint() / 组内各 worker 各自随机种子破坏 GRPO 可比性）；`env_manager.py`
+直接复用 WebshopEnvironmentManager 也不成立（对图像观测做字符串切分）；
+`projection.py` 把任何垃圾输出都判 valid=1。已全部重写，详细清单见
+`verl_debug_progress.md` 第 2 层。
 
 | 轮次 | 结果 | 原因 |
 |---|---|---|
 | d1 | ❌ D/E/F 全挂 | 跑在 base env（坑 5） |
 | d2 | ❌ 没跑到 D | 装完 openjdk 后 nounset 退出（坑 6） |
-| d3 | ⏳ 在跑 | — |
+| d4 | ❌ E 挂 | Malmo 引擎首次运行需交互确认下载，非交互 job 直接 EOFError |
+| **d5** | **✅ D,E,F,G (4/4) 通过** | 补齐 setup 脚本里的 cuda-python 钉版本 + Malmo 引擎 S3 镜像下载 |
+
+⚠️ 已知限制：`MinecraftEnvironmentManager` 每样本仅 1 张图，与评测的 h29
+多图历史不一致，是后续必须解决的结构性差距。
+
+## 第 3 步（GRPO 训练启动）：进行中
+
+详见 `verl_debug_progress.md`。`colocate-p2` 已确认 torch2.10+transformers5.15+
+vllm0.17 组合可行（HF↔vLLM 权重同步能走通）；`run_grpo_minecraft_smoke.sh`
+六轮迭代已修复 5 个独立兼容性问题（Hydra struct 键校验、batch/GPU 整除断言、
+flash_attn.bert_padding 无条件导入、AutoModelForVision2Seq 改名），`smoke6`
+验证中。
 
 
 ## VERL_AGENT_COMMIT
