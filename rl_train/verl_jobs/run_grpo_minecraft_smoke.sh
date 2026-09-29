@@ -13,6 +13,11 @@
 #     建议的写法：显式声明"这是新增键"而非覆盖已有键。
 #   - env.minecraft.system_message_tag=text_action —— 与评测 SYSTEM_MESSAGE_TAG 一致
 #   - actor_rollout_ref.model.path 用 continue-SFT 起点（v2-e4），不是原始基座
+#   - enable_chunked_prefill=True 是**必需项**，不是性能选项——09-29 smoke6 实测：
+#     Qwen3.5 的 fla 混合注意力（mamba/gated-delta-net cache）在当前 vLLM 版本下
+#     要求 cache mode 'align'，而这要求 chunked prefill 开启，False 会在
+#     VllmConfig 校验阶段直接 pydantic ValidationError（"Chunked prefill is
+#     required for mamba cache mode 'align'"），根本起不来 engine。
 #
 # 已知限制（见 MinecraftEnvironmentManager 文档串）：每样本仅 1 张图，非 h29 多图
 # 历史——冒烟阶段可接受，度量吞吐/验证训练循环不受影响；真实性能评测需另行处理。
@@ -64,7 +69,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.mode=sync \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
-    actor_rollout_ref.rollout.enable_chunked_prefill=False \
+    actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.enforce_eager=True \
     actor_rollout_ref.rollout.free_cache_engine=True \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.4 \
