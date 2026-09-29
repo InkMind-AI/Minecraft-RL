@@ -191,17 +191,22 @@ _install_missing_no_deps "from agent_system.environments.env_package.minecraft i
 _install_missing_no_deps "from minestudio.utils import get_mine_studio_dir"
 _assert_torch_unchanged "④minestudio"
 
+# ⚠ 09-29：这个坑连续咬了三次，根源是"openjdk 的 conda 钩子普遍不兼容
+# set -u"，不是某一次操作特有的：
+#   smoke7 -- 装的瞬间：deactivate.d/openjdk_deactivate.sh 读
+#             $JAVA_HOME_CONDA_BACKUP，装完立即 unbound variable 退出
+#   smoke8 -- 装完之后、job 脚本里多余的第二次 `conda activate vllmtrain`：
+#             activate.d/openjdk_activate.sh 读 $target_platform，同样炸
+# 只在 install 这一行局部关 set -u（此前的修法）治不了后者，因为炸点在
+# **本脚本 source 结束之后、调用方自己的代码里**——sourced 脚本改的 shell
+# 选项会保留到调用方后续执行。因此在检查/安装 openjdk 之前就关掉 set -u，
+# 且从这里开始**不再恢复**，兜住"java 已存在从而跳过安装分支"和"调用方
+# 之后自己再 activate/deactivate 一次"两种情形。其余逻辑一律用
+# `${VAR:-default}` 写法保证在 nounset 关闭下也不出错（本脚本从头至尾的风格）。
+set +u
 if ! command -v java >/dev/null 2>&1; then
     echo "[setup] installing openjdk=8"
-    # ⚠ 09-29 smoke7 复现坑 6（此前只在 setup_openha_env.sh 里修过，这个新脚本
-    # 漏搬了同一处防护）：openjdk 包的 conda 钩子
-    # `deactivate.d/openjdk_deactivate.sh` 直接读 `$JAVA_HOME_CONDA_BACKUP`，
-    # 在调用方 `set -euo pipefail` 下（本脚本顶部只 `set +e`，未关 nounset）
-    # 装完 openjdk 立即 `JAVA_HOME_CONDA_BACKUP: unbound variable` 退出。
-    # conda install 期间关掉 nounset，装完立即恢复。
-    set +u
     conda install --channel=conda-forge openjdk=8 -y -q
-    set -u
 fi
 if ! python -c "from cuda import cuda, cudart" >/dev/null 2>&1; then
     pip install -q --no-deps "cuda-python==12.6.2.post1"
