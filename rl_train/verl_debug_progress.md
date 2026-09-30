@@ -200,6 +200,68 @@ dataloader 开始工作），问题域已经从"环境/配置能不能起来"彻
 `smoke7`/`smoke8` 是同一个 openjdk 坑的两次不同触发路径，已改为从根上
 （不恢复 `set -u`）解决，理论上不会再犯第三次。
 
+### 静态审查：提前排查 dataloader 之后的未执行代码（09-30）
+
+每轮真实冒烟要等 ~8 小时集群排队，逐个试错不可接受，因此对
+`smoke10` 崩点之后的整条链路（rollout loop → env manager → projection →
+reward → advantage → update）做了系统性静态审查。结果如下。
+
+**① 确凿 bug，已修**：`env_manager.py` 的 minecraft 分支是**唯一没有透传
+`resources_per_worker` 的 env 分支**（sokoban/alfworld/gymcards/webshop 都传了），
+导致启动脚本里的 `env.resources_per_worker.num_cpus` 是死参数，
+`MinecraftWorker` 一直用写死的 `@ray.remote(num_cpus=2)`。CPU 预留随
+`train_batch_size × group_n + 验证集` 线性增长，很容易超过 koala 的每卡 CPU
+配额；**超了之后 Ray actor 不报错、只是永久 PENDING**，最终在 `reset()` 的
+`ray.get(..., timeout=900)` 抛 `GetTimeoutError`——现象（卡 15 分钟后超时）
+和根因（CPU 预留超配额）完全不像，极难定位。已改为仿 sokoban 的
+`ray.remote(**resources_per_worker)(MinecraftWorker)` 动态包装，默认 0.5 CPU
+（真实计算在独立的 Malmo JVM 进程里，Ray actor 只做 RPC 转发）。
+
+**② 两个"必崩"结论经核实是误报**（值得记下来，避免以后重复怀疑）：
+审查认为 Qwen3.5 的 processor 类名会是 `Qwen3_5*`，从而
+`rl_dataset.py:235` 的门控 `"Qwen2VLImageProcessor" in image_processor 类名`
+会失配、使 dataloader 与 rollout 产出不同形状的 `position_ids`。但实际读
+`processor_config.json`：
+
+```
+image_processor_type = "Qwen2VLImageProcessor"   ← dataloader 门控命中
+processor_class      = "Qwen3VLProcessor"        ← 选 qwen3_vl.get_rope_index
+merge_size           = 2
+```
+
+且 `config.json` 的 `text_config.rope_parameters` 为
+`{mrope_section: [11,11,10], mrope_interleaved: true}`——**Qwen3.5 确实用
+mrope**，所以 4 行 `position_ids`（1 文本 + 3 视觉）是**正确约定而非 bug**，
+两处门控实际都落在同一分支。
+
+**③ 剩余的真正未知（静态读不出来，只能实跑）**：`qwen2_vl` 适配器在前向里调
+`process_position_ids()` 校验/裁剪 `(4,bs,seq)`，而 `qwen3_5_base_forward`
+**完全没有这一步**、直接 `**kwargs` 透传给 `language_model`。4 行 mrope 能否
+被 transformers 5.15 的 Qwen3.5 接受，取决于其内部实现，读代码无法判定。
+
+**对策——`smoke_step3.py`**：把所有剩余未知压进**一个** 1-GPU 任务，每层
+独立 try/except（一层失败不遮挡其余），一次排队拿到全部答案：
+
+| 层 | 验什么 |
+|---|---|
+| H | processor / image_processor 真实类名 → 两处 mrope 门控各走哪个分支 |
+| I | rollout 侧硬编码的 `processor.image_token`、`merge_size`、`image_grid_thw` 键、以及 `get_rope_index` 需要的 `image/video/vision_start_token_id` 是否都存在 |
+| J | 用真实 processor + 真实图实跑 `get_rope_index`，确认输出行数 |
+| **K** | **★ 4 行 mrope 能否走通 Qwen3_5 的 PPO 前向**（复刻 `dp_actor` transpose 后的真实形态，最关键） |
+| L | 真实 prompt 的 token 数 vs `max_prompt_length=1024`（`truncation='error'` 下超限即每步必崩；`text_action.txt` 1.8KB + 640×360 POV 的 vision token 估算已逼近上限） |
+
+**④ 已核对确认无问题的项**（不必再查）：reward 接线（`EpisodeRewardManager`
+无条件启用，不需注册 custom reward；`use_invalid_action_penalty` 依赖的
+`is_action_valid` 键名两侧一致）、`data_source="visual"` 不参与任何分发分支
+（只用于日志计数）、GRPO 的 batch 整除断言（相关断言已被上游注释掉，且
+`adjust_batch` 会按 lcm 补齐）、`multi_modal_data` 的 vLLM 约定、
+`success_evaluator` 读的 `info['won']`、`compute_data_metrics` 所需的全部键。
+
+**⑤ 已知但暂不处理**：占位 parquet 的 `prompt`/`images` 在 rollout 里会被
+完全丢弃（`rollout_loop.py:78-87` 把 `obs_content` 重置为环境产出），所以
+`prepare_minecraft_data.py` 里那张占位图的**内容**无所谓——它只影响
+dataloader 阶段算出、随后被覆盖的 `input_ids`。记下来避免以后误以为要对齐。
+
 ---
 
 ## 通用教训（贯穿全程，写入 `verl_migration.md` 的坑清单）
