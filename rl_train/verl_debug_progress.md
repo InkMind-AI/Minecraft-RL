@@ -11,7 +11,7 @@
 | **1. 适配器** | verl-agent + qwen3_5 模型后端，真实 9B 权重前向 | ✅ 通过（`verl-c4`，09-27） |
 | **2. 环境接入** | Minecraft/Malmo 环境包 + `MinecraftEnvironmentManager` | ✅ 通过（`verl-env-d5`，09-28） |
 | **2.5 训练/推理共存可行性** | HF 训练 + vLLM 推理能否同进程、权重能否同步 | ✅ 可行（`colocate-p2`，09-28） |
-| **3. GRPO 训练启动** | `verl.trainer.main_ppo` 端到端跑通 rollout→advantage→update | ⏳ 调试中（`grpo-smoke1`→`smoke9`，09-28~09-29，7 个根因已修，`smoke9` 排队中） |
+| **3. GRPO 训练启动** | `verl.trainer.main_ppo` 端到端跑通 rollout→advantage→update | ⏳ 调试中（`grpo-smoke1`→`smoke11`，09-28~09-30，8 个根因已修，`smoke10` 已真正进入训练循环，`smoke11` 排队中） |
 | **4. 端到端训练 + 吞吐** | ≥2 个 update step 完整跑通；吞吐/GPU 利用率对比自研线 | ❌ 尚未开始 |
 
 ---
@@ -186,13 +186,17 @@ Pyro4/xmltodict) → ⑥ 逐个 import 复核），是在多轮实测中被迫�
 | `smoke6` | **首次跑过全部 setup**（fla/minestudio/真实 Malmo 冒烟全绿），到达 vLLM engine 初始化才报错：`pydantic ValidationError: Chunked prefill is required for mamba cache mode 'align'` | Qwen3.5 的 fla 混合注意力（mamba/gated-delta-net cache）在当前 vLLM 版本下要求 chunked prefill 开启，脚本里写死了 `enable_chunked_prefill=False` | 改为 `True` |
 | `smoke7` | `setup_vllmtrain_env.sh` 装完 openjdk 立即退出：`JAVA_HOME_CONDA_BACKUP: unbound variable` | openjdk 的 conda 钩子（`deactivate.d/openjdk_deactivate.sh`）不兼容 `set -u`；这个坑此前只在 `setup_openha_env.sh` 里修过，新脚本漏搬同一处防护（间歇性——同一脚本在 `smoke6` 那次没触发） | 装 openjdk 前后临时关/开 `set -u`（第一版局部修法） |
 | `smoke8` | **setup 完整跑完**（`SETUP_VLLMTRAIN_DONE` 打印），但 job 脚本自己**多余的第二次** `conda activate vllmtrain` 又炸：`activate.d/openjdk_activate.sh: target_platform: unbound variable` | 同一类坑的第二次复现：`smoke7` 的局部修法只在"安装那一刻"关 `set -u`，装完立刻恢复，治不了脚本 source 结束后、调用方自己再 activate 一次的场景 | 精简 job 脚本去掉重复 activate；同时把 setup 脚本的修法从"局部关闭"改为"检查 java 之前关闭、之后不再恢复"，一次性兜住所有后续 activate/deactivate |
-| `smoke9` | ⏳ 已提交，`Queuing #11`（集群排队，尚未开始执行） | — | — |
+| `smoke9` | 提交失败——CLI 升级到 2.4.0 后 `--s3-log` 参数被移除 | 用法过时，不是代码问题 | 改用 `smoke10`（去掉 `--s3-log`） |
+| `smoke10` | 排队 **8 小时+**（集群资源被同 namespace 其他任务占满，配额本身充足）后终于跑起来，**第一次完整通过 setup 和所有此前 7 个坑，真正进入 GRPO 训练循环（Ray dataloader 开始跑）**，撞上第 8 个坑：`AttributeError: '_io.BytesIO' object has no attribute 'startswith'` | verl 自带 `vision_utils.process_image()` 把 `{"bytes": png}` 转成 `image["image"]=BytesIO(...)` 再调 `qwen_vl_utils.fetch_image()`——但 `fetch_image` 只认 `PIL.Image` 或 `str`（http(s):// / file:// / data:image base64 / 本地路径），**完全不支持 BytesIO**，这是 verl-agent 自带代码与当前 `qwen_vl_utils` 版本的不匹配，不是我们的适配层问题 | `prepare_minecraft_data.py` 改为把占位图写成真实 PNG 文件，`images` 列用 `{"image": "file://<path>"}` 代替 `{"bytes": ...}`，绕开这条有 bug 的分支（`file://` 是 `fetch_image` 明确支持的格式，本地已用 pandas/pyarrow round-trip 验证格式不变） |
+| `smoke11` | ⏳ 已提交（`--cluster aws` 排队 #14），提交时又撞上 `koala update` 强制版本门禁（`当前版本2.4.0 已低于平台要求的最低版本2.4.1`），`koala update` 本身因缺 `OSS_ACCESS_KEY_ID/SECRET` 失败；改为从 `s3://arcwm-code-us-west-2/tools/koala/koala-2.4.1-darwin-arm64.tar.gz` 直接下载校验 sha256 后手动替换本地二进制，绕开对 OSS 凭据的依赖 | — | — |
 
-前 8 轮修复均已提交并同步到 S3；每轮都是"改代码 → 语法检查 → 提交 → 用 S3
-日志目录核实真的入队 → 拉日志定位下一个问题"的循环，累计暴露 7 个独立
-根因（6 个环境/框架兼容性问题 + openjdk 的 `set -u` 坑复现两次）。**`smoke6`
-是重要里程碑**：环境组装（fla 内核、minestudio、真实起一次 Malmo）第一次
-完整走完不再报错，问题域已从"环境能不能装起来"收窄到"训练配置/收尾细节"。
+前 9 轮修复均已提交并同步到 S3；每轮都是"改代码 → 语法检查 → 提交 → 拉日志
+定位下一个问题"的循环，累计暴露 8 个独立根因（6 个环境/框架兼容性问题 +
+openjdk 的 `set -u` 坑复现两次 + verl 自带图像加载代码的版本不匹配 bug）。
+**`smoke10` 是迄今最重要的里程碑**：不仅环境组装（fla 内核、minestudio、
+真实起一次 Malmo）完整通过，**GRPO 训练循环本身第一次真正跑起来**（Ray
+dataloader 开始工作），问题域已经从"环境/配置能不能起来"彻底转移到
+"训练逻辑内部的数据/模型细节"——这是全新的、更接近终点的问题层级。
 `smoke7`/`smoke8` 是同一个 openjdk 坑的两次不同触发路径，已改为从根上
 （不恢复 `set -u`）解决，理论上不会再犯第三次。
 
@@ -217,56 +221,45 @@ Pyro4/xmltodict) → ⑥ 逐个 import 复核），是在多轮实测中被迫�
    代码路径会触发同一类不兼容操作（如再调一次 `conda activate`），必须
    在 sourced 脚本里"从此不再恢复"才能彻底兜住，不能只治第一次触发点
 
-## 当前状态（09-30，被集群基础设施问题阻塞，仍未解除）
+## 当前状态（09-30 深夜，重大突破：训练循环已真正跑起来）
 
-`smoke9` 因 CLI 升级后 `--s3-log` 被移除而失败提交（见下），改用 `smoke10`
-（1 GPU，去掉 `--s3-log`）重新提交，**已排队超过 8 小时，队列位次
-#21→#19→#15→#12，移动极其缓慢**——确认是同 namespace 下其他用户的任务
-占满了集群，不是自己的代码或配额问题（`koala quota show` 显示 32 卡仅
-占用 1 卡，31 卡空闲于己但被排队机制挡在前面的任务占用）。
+`smoke10` 排队超过 8 小时（#21→#19→#15→#12，确认是集群资源被同 namespace
+其他任务占满，非自己的配额/代码问题）后终于开始执行，**第一次完整跑过全部
+setup 和此前 7 个坑，真正进入了 GRPO 训练循环**（Ray dataloader 开始工作），
+在读取占位图片数据时撞上第 8 个坑（verl 自带 `vision_utils.py` 与
+`qwen_vl_utils` 版本不匹配，见上表），已修复并提交 `smoke11`（排队 #14）。
 
-**已排除的绕行方案**：
+**排队期间探索过的两条绕行方案，均已确认不可行**：
 
-1. **迁移到 H20 集群**（完全空闲，32 卡可用、队列为空）——探针任务提交后
-   卡在 `ContainerCreating` 超过 5 分钟未起（诊断直接提示"节点故障"），大概率
-   是阿里云节点拉 AWS ECR 镜像跨云失败/极慢。**代码和模型权重都在 AWS S3，
-   短期内不具备迁移 H20 的条件**
-2. **改用 debug 模式 + `koala exec`/`koala ssh` 交互式跑**——debug 配额是独立
-   并发池，提交后立即 `Running`（不受 normal 队列排队影响），但 `koala ssh
-   --connect` / `koala exec` 反复重试 40 次后必然报
-   `Connection aborted: RemoteDisconnected`。排查过程：
-   - `ssh cvm`（跳板机第一跳）直连测试**成功**——网络本身通
-   - `~/.ssh/config` 里 `Host koala` 只有 `ProxyJump cvm`，缺 `HostName`——
-     说明"cvm → pod"这一跳的隧道建立步骤从未成功写回配置
-   - `koala get` 确认 pod 本身 `Running`（k8s/MPIJob 状态正常，命令是占位的
-     `sleep 8h`）——**pod 健康，问题在 cvm 到 pod 的隧道/端口转发这一层**，
-     是基础设施问题，非本地配置或代码可修
-   - 已删除该 debug pod 释放配额（`koala exec` 交互式调试这条路当前**不可用**）
+1. **迁移到 H20 集群**（完全空闲）——跨云拉 AWS ECR 镜像卡在
+   `ContainerCreating` 超 5 分钟，代码/权重都在 AWS S3，暂不具备迁移条件
+2. **debug 模式 + `koala exec`/`koala ssh`**——pod 本身健康，但 cvm→pod
+   隧道建立失败（基础设施问题，非本地配置可修），交互式调试路径当前不可用
 
-一旦 `smoke10` 真正开始跑，理论上应该：沿用 `smoke6` 已验证过的 setup 路径
-（fla/minestudio/Malmo 全部装好）→ 用 `smoke6` 定位到的
-`enable_chunked_prefill=True` 修复过 vLLM engine 初始化 → 用 `smoke7`/`smoke8`
-修复过的 openjdk `set -u` 问题 → 第一次真正进入 GRPO 训练循环
-（rollout → advantage → update）。**修复本身没有新问题，纯粹卡在排队。**
+**期间还处理了两次 koala CLI 版本相关的意外阻塞**：
 
-⚠️ **koala CLI 已升级 2.3.6 → 2.4.0，带来两处不兼容**：
-1. 默认集群改为 H20，AWS 集群需显式加 `--cluster aws`（否则 `koala ls`
-   看不到任务，会误判"队列已空"）
-2. **`--s3-log` 参数已被移除**（"仅支持平台保留的 Pod 日志"），此前全程依赖的
-   "`--s3-log` 提交 + `aws s3 cp .koala-logs/...` 拉日志"这套流程**不再可用**，
-   改用 `koala logs <job> --cluster aws --all`（任务结束后日志是否仍可查还
-   需要验证——`.koala-logs` 这条路径已知失效，后续必须切到 `koala logs`）
+1. **2.3.6→2.4.0**：默认集群改为 H20（AWS 集群需显式加 `--cluster aws`）；
+   **`--s3-log` 参数被移除**，此前全程依赖的 `.koala-logs` S3 拉日志方式
+   失效，改用 `koala logs <job> --cluster aws --all`
+2. **2.4.0→2.4.1**：平台设了版本门禁，`koala update` 因缺
+   `OSS_ACCESS_KEY_ID/SECRET` 失败——绕开方式：直接从
+   `s3://arcwm-code-us-west-2/tools/koala/koala-2.4.1-darwin-arm64.tar.gz`
+   下载（sha256 校验通过），解压后手动替换 `~/.local/bin/koala` 的软链接
+   目标，不依赖 OSS 凭据
 
 H20 集群的路径/存储约定也变了（个人持久目录 `/cpfs/<企业ID>`，代码走东京
 OSS）——只有在真正决定迁移 H20 时才需要处理，目前不适用。
 
 ## 下一步
 
-1. 继续等 `smoke10` 排队（唯一在推进的路径），到号后立即用 `koala logs
-   --cluster aws --all` 拉取结果（新日志方式，不再是 S3 路径）
-2. 若排队持续无进展，可考虑：拆分更小的资源请求（已试 1 GPU，效果有限）、
-   找管理员/工单排查集群拥堵、或排查 `koala ssh`/`exec` 隧道故障是否是
-   全局性问题（值得报给平台方，这样后续能用 debug 模式绕开 normal 排队）
+1. 等 `smoke11` 排队结束并跑完，验证 `file://` 图片路径的修复是否生效、
+   是否还有第 9 个坑（训练循环内部大概率还有别的数据/模型细节问题，
+   `smoke10` 只是刚踏入这一层，不能假设一次就能跑完 2 个完整 update step）
+2. 跑通冒烟后，扩大到真正的小规模训练（≥2 个 update step，非冒烟规模）
+3. 测吞吐/GPU 利用率，对比自研线（HTTP eval-harness rollout）——这是切换
+   决策的核心指标，目前仍是空白
+4. 解决"每样本单图 vs h29 多图历史"的结构性差距，否则 verl 线产出的策略
+   与评测条件不一致，无法做公平的成绩对比
 3. 跑通冒烟后，扩大到真正的小规模训练（≥2 个 update step，非冒烟规模）
 4. 测吞吐/GPU 利用率，对比自研线（HTTP eval-harness rollout）——这是切换
    决策的核心指标，目前仍是空白
