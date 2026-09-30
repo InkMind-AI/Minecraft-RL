@@ -110,9 +110,20 @@ def _build_sim(task_config: Dict[str, Any], record_path: Optional[str], fps: int
 # Ray remote worker ------------------------------------------------------------
 # -----------------------------------------------------------------------------
 
-@ray.remote(num_cpus=2)
 class MinecraftWorker:
-    """一个 Ray actor 托管一个 MinecraftSim。"""
+    """一个 Ray actor 托管一个 MinecraftSim。
+
+    ⚠ 09-30：这个类**不带 `@ray.remote` 装饰器**，由 `MinecraftMultiProcessEnv`
+    用 `ray.remote(**resources_per_worker)(MinecraftWorker)` 动态包装——与
+    `sokoban/envs.py:85` 同一写法。原先写死 `@ray.remote(num_cpus=2)`，导致
+    启动脚本里的 `env.resources_per_worker.num_cpus` 是死参数（env_manager 的
+    minecraft 分支当时也没往下传，见同日修复），且 CPU 预留随
+    `train_batch_size × group_n` 线性膨胀：worker 数 = 组数 × 组大小 + 验证集，
+    每个固定吃 2 CPU，很容易超过 koala 的每卡 CPU 配额（-g 1 默认 20 CPU），
+    超了以后 Ray actor 永久 PENDING，最终在 `reset()` 的
+    `ray.get(..., timeout=reset_timeout_s)` 抛 GetTimeoutError——表现为"卡住
+    15 分钟后超时"，很难一眼看出是 CPU 预留问题。
+    """
 
     def __init__(self, env_id: int = 0, max_steps: int = DEFAULT_MAX_STEPS):
         self.env_id = env_id
@@ -217,9 +228,15 @@ class MinecraftMultiProcessEnv(gym.Env):
     """env_num 个任务组 × 每组 group_n 个 worker（同组共享同一 task_config）。"""
 
     def __init__(self, env_num: int = 1, group_n: int = 1, is_train: bool = True,
+                 resources_per_worker: Optional[dict] = None,
                  env_kwargs: Optional[dict] = None) -> None:
         super().__init__()
         env_kwargs = dict(env_kwargs or {})
+        # 每个 worker 的 Ray 资源预留。默认 0.5 CPU（不是原先写死的 2）：Malmo 的
+        # 真实计算在独立的 JVM 进程里，Ray actor 本身只做 RPC 转发，预留过多会
+        # 在 worker 数增长时直接撞上 koala 的每卡 CPU 配额（详见 MinecraftWorker
+        # 的文档串）。sokoban 同理用 0.1。
+        resources_per_worker = dict(resources_per_worker or {"num_cpus": 0.5})
         if not is_train:
             assert group_n == 1, "验证集不分组"
         self.env_num = env_num
@@ -243,7 +260,8 @@ class MinecraftMultiProcessEnv(gym.Env):
 
         if not ray.is_initialized():
             ray.init(ignore_reinit_error=True)
-        self._workers = [MinecraftWorker.remote(i, self.max_steps) for i in range(self.num_processes)]
+        env_worker = ray.remote(**resources_per_worker)(MinecraftWorker)
+        self._workers = [env_worker.remote(i, self.max_steps) for i in range(self.num_processes)]
         self._closed = False
 
     # ------------------------------------------------------------------
@@ -303,7 +321,10 @@ class MinecraftMultiProcessEnv(gym.Env):
 
 
 def build_minecraft_envs(env_num: int = 1, group_n: int = 1, is_train: bool = True,
+                         resources_per_worker: Optional[dict] = None,
                          env_kwargs: Optional[dict] = None):
-    """与 build_sokoban_envs 同形的工厂函数。"""
+    """与 build_sokoban_envs 同形的工厂函数（含 resources_per_worker 透传）。"""
     return MinecraftMultiProcessEnv(env_num=env_num, group_n=group_n,
-                                    is_train=is_train, env_kwargs=env_kwargs)
+                                    is_train=is_train,
+                                    resources_per_worker=resources_per_worker,
+                                    env_kwargs=env_kwargs)

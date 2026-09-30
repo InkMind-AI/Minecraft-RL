@@ -739,8 +739,13 @@ def make_envs(config):
             'record_path': mc.get("record_path", None),
             'seed': config.env.seed,
         }
-        _envs = build_minecraft_envs(config.data.train_batch_size, group_n, is_train=True, env_kwargs=env_kwargs)
-        _val_envs = build_minecraft_envs(config.data.val_batch_size, 1, is_train=False, env_kwargs=env_kwargs)
+        # resources_per_worker 必须透传（其他所有 env 分支都传）——漏传会让启动
+        # 脚本里的 env.resources_per_worker 成为死参数，worker 退回写死的 CPU
+        # 预留，worker 数一多就撞 koala 每卡 CPU 配额并静默卡成 PENDING。
+        _envs = build_minecraft_envs(config.data.train_batch_size, group_n, is_train=True,
+                                     resources_per_worker=resources_per_worker, env_kwargs=env_kwargs)
+        _val_envs = build_minecraft_envs(config.data.val_batch_size, 1, is_train=False,
+                                         resources_per_worker=resources_per_worker, env_kwargs=env_kwargs)
 
         projection_f = partial(minecraft_projection)
         envs = MinecraftEnvironmentManager(_envs, projection_f, config)
