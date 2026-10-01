@@ -615,10 +615,24 @@ class MinecraftEnvironmentManager(EnvironmentManagerBase):
     task_config["task_description"]。这里生成 `system+instruction<image>`，verl-agent
     rollout 会把 `<image>` 展开为 `<|vision_start|>…<|vision_end|>`，顺序一致。
 
-    ⚠ 已知差距（迁移第 3 步处理）：评测协议是 h29 多图历史，但 verl-agent 的
-    rollout_loop.preprocess_single_sample 每个样本只放 1 张图。当前等价于"每一步都是
-    轨迹首帧"——这恰好是 SFT 数据里第一个 turn 的格式，属于分布内，能跑通 RL，
-    但策略看不到历史，和评测条件不同。
+    **多轮上下文（10-01，对齐评测 h29）**：`env.history_length = H > 0` 时，每个环境
+    维护最近 H 步的 (画面, 模型当步回复)，按 `openagents/agents/openha.py` 的
+    `gen_response`（331–346 行）逐字构造多轮对话：
+      - 有历史时：第 1 条 user = system_message + instruction + 历史图 1，随后
+        assistant = 当时的回复；之后每条 user 只有历史图（文本为空）+ 对应回复；
+        最后一条 user = 当前画面（文本为空）
+      - 无历史时（每局第 1 步）：唯一一条 user = system_message + instruction + 当前画面
+    窗口与评测一致：`self._history[-H:]`，H=29 → 最多 30 张图。
+    历史里存的回复就是 rollout 解码出的完整文本（含可能的 Thought），与评测
+    `refresh_history` 存 `self._response`（vLLM 输出 content）一致。
+
+    输出给 rollout 的是**结构化上下文** `obs["chat"][i] = {"prefix", "turns", "current"}`
+    （turns 为 [(frame_id, response), ...]），由 rollout_loop 渲染成对话、展开图像
+    token；画面本身存在本 Manager 的 frame store 里（按 frame_id 取，`obs["get_frame"]`）。
+    之所以不直接塞 30 张图进 obs：同一帧会被后续 29 步反复引用，按 id 共享可以避免
+    每步复制/重复预处理，也让 rollout 能把 pixel_values 推迟到"抽中参与训练"的样本
+    才计算（见 rollout_loop.gather_rollout_data）。
+    H=0 时行为与 09-28 版本逐字相同（单帧 prompt，不输出 chat）。
     """
 
     def __init__(self, envs, projection_f, config):
@@ -627,11 +641,16 @@ class MinecraftEnvironmentManager(EnvironmentManagerBase):
         mc_cfg = config.env.get("minecraft", {}) if hasattr(config.env, "get") else {}
         tag = mc_cfg.get("system_message_tag", "text_action") if mc_cfg else "text_action"
         self.system_message = get_system_prompt(tag)
-        history_length = int(config.env.get("history_length", 0) or 0)
-        if history_length > 0:
-            print(f"[MinecraftEnvironmentManager] ⚠ env.history_length={history_length} 被忽略："
-                  f"当前 rollout 每样本只支持 1 张图，按单帧 prompt 运行", flush=True)
+        self.history_length = int(config.env.get("history_length", 0) or 0)
         self.tasks: List[str] = []
+        self._episode = 0
+        self._frames: Dict[str, Any] = {}
+        self._hist: List[Any] = []
+        self._cur_fids: List[str] = []
+        self._t: List[int] = []
+        print(f"[MinecraftEnvironmentManager] history_length={self.history_length} "
+              f"({'多轮上下文，对齐评测 h' + str(self.history_length) if self.history_length else '单帧 prompt'})",
+              flush=True)
 
     def _texts(self, n: int) -> List[str]:
         return [f"{self.system_message}{self.tasks[i]}<image>" for i in range(n)]
@@ -640,20 +659,58 @@ class MinecraftEnvironmentManager(EnvironmentManagerBase):
     def _stack(images):
         return np.stack([np.asarray(im, dtype=np.uint8) for im in images], axis=0)
 
+    # ---------------- 多轮上下文 ----------------
+    def get_frame(self, fid: str):
+        """frame_id → 已预处理的 PIL 图（与 rollout 单帧路径的 process_image 同一处理）。"""
+        return self._frames[fid]
+
+    def _store_frames(self, obs_list) -> List[str]:
+        from agent_system.multi_turn_rollout.utils import process_image
+        fids = []
+        for i, o in enumerate(obs_list):
+            fid = f"e{self._episode}-w{i}-t{self._t[i]}"
+            self._t[i] += 1
+            self._frames[fid] = process_image(np.asarray(o, dtype=np.uint8))
+            fids.append(fid)
+        return fids
+
+    def _chat_structs(self) -> List[Dict[str, Any]]:
+        return [{"prefix": f"{self.system_message}{self.tasks[i]}",
+                 "turns": list(self._hist[i]),
+                 "current": self._cur_fids[i]}
+                for i in range(len(self._cur_fids))]
+
+    def _observations(self, obs_list) -> Dict[str, Any]:
+        texts = self._texts(len(obs_list))
+        out = {"text": texts, "image": self._stack(obs_list), "anchor": list(texts)}
+        if self.history_length > 0:
+            out["chat"] = self._chat_structs()
+            out["get_frame"] = self.get_frame
+        return out
+
     def reset(self, kwargs) -> Tuple[Dict[str, Any], List[Dict]]:
+        from collections import deque
         obs, infos = self.envs.reset()
         self.tasks = [info["task_description"] for info in infos]
-        texts = self._texts(len(obs))
-        return {"text": texts, "image": self._stack(obs), "anchor": list(texts)}, infos
+        if self.history_length > 0:
+            self._episode += 1
+            self._frames = {}   # 上一轮 rollout 的样本已在 gather_rollout_data 里物化完毕
+            self._t = [0] * len(obs)
+            self._hist = [deque(maxlen=self.history_length) for _ in range(len(obs))]
+            self._cur_fids = self._store_frames(obs)
+        return self._observations(obs), infos
 
     def step(self, text_actions: List[str]):
         actions, valids = self.projection_f(text_actions)
         next_obs, rewards, dones, infos = self.envs.step(actions)
         for i, info in enumerate(infos):
             info["is_action_valid"] = to_numpy(valids[i])
-        texts = self._texts(len(next_obs))
-        next_observations = {"text": texts, "image": self._stack(next_obs), "anchor": list(texts)}
-        return next_observations, to_numpy(rewards), to_numpy(dones), infos
+        if self.history_length > 0:
+            # 与评测 refresh_history 同序：先把 (当步画面, 当步回复) 入历史，再换成新画面
+            for i in range(len(next_obs)):
+                self._hist[i].append((self._cur_fids[i], text_actions[i]))
+            self._cur_fids = self._store_frames(next_obs)
+        return self._observations(next_obs), to_numpy(rewards), to_numpy(dones), infos
 
     def close(self) -> None:
         try:
@@ -729,7 +786,13 @@ def make_envs(config):
         # MinecraftEnvironmentManager 文档串）。env 包也已按当前 openagents API 重写。
         from agent_system.environments.env_package.minecraft import build_minecraft_envs, minecraft_projection
         mc = config.env.minecraft
-        tasks = mc.get("tasks", None) or [mc.task_name]
+        tasks_file = mc.get("tasks_file", None)
+        if tasks_file:
+            with open(tasks_file) as f:
+                tasks = [l.strip() for l in f if l.strip() and not l.strip().startswith("#")]
+            print(f"[make_envs] minecraft 任务池来自 {tasks_file}：{len(tasks)} 个任务", flush=True)
+        else:
+            tasks = mc.get("tasks", None) or [mc.task_name]
         if isinstance(tasks, str):
             tasks = [t.strip() for t in tasks.split(",") if t.strip()]
         env_kwargs = {

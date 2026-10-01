@@ -92,16 +92,42 @@ fi
 # 显存池（free_cache_engine=True 依赖的 CuMemAllocator）直接断言二者不兼容
 # （smoke13 实测 AssertionError，pytorch#147851）。显存余量靠上面的 offload 解决。
 
+# ─── 10-01：h29 多轮上下文（对齐评测 MAXIMUM_HISTORY_LENGTH=29 / LIMIT_MM_IMAGE=30）───
+# HISTORY_LENGTH=0 保持 smoke16 的单帧 prompt；>0 时 MinecraftEnvironmentManager 按
+# openha.gen_response 逐字构造多轮对话（本地已验证与评测列表形式渲染逐字一致）。
+# h29 实测 prompt 约 7.9k token（30 图 × 220 + system ~500 + 29 条回复），上限留到 10240；
+# 偶发超长时 rollout 从最旧历史开始丢弃，不会中断训练。
+HISTORY_LENGTH="${HISTORY_LENGTH:-0}"
+if [ "$HISTORY_LENGTH" -gt 0 ]; then
+    MAX_PROMPT_LEN="${MAX_PROMPT_LEN:-10240}"
+    LIMIT_IMAGES="${LIMIT_IMAGES:-$((HISTORY_LENGTH + 1))}"
+else
+    MAX_PROMPT_LEN="${MAX_PROMPT_LEN:-1024}"
+    LIMIT_IMAGES="${LIMIT_IMAGES:-1}"
+fi
+# vLLM 开 chunked prefill 时要求 max_num_batched_tokens >= max_model_len(=prompt+response)
+MAX_BATCHED_TOKENS="${MAX_BATCHED_TOKENS:-$(( (MAX_PROMPT_LEN + MAX_RESPONSE_LEN) > 8192 ? 16384 : 8192 ))}"
+# 每条轨迹参与梯度的环境步数（0=全部）。h29 下每个样本带 30 张图约 155MB pixel_values，
+# 必须抽样；见 rollout_loop.gather_rollout_data。
+TRAIN_STEPS_PER_TRAJ="${TRAIN_STEPS_PER_TRAJ:-0}"
+VAL_BATCH="${VAL_BATCH:-$TRAIN_BATCH}"
+TASKS_FILE="${TASKS_FILE:-}"
+if [ -n "$TASKS_FILE" ]; then _TASK_ARGS=("env.minecraft.tasks_file=$TASKS_FILE"); else _TASK_ARGS=("env.minecraft.tasks=$TASKS"); fi
+# 验证采样与评测 harness 一致（run_backbone_eval.sh: TEMPERATURE=0.8 TOP_P=0.99）
+VAL_TEMPERATURE="${VAL_TEMPERATURE:-0.4}"
+VAL_TOP_P="${VAL_TOP_P:-1.0}"
+MAX_CKPT_TO_KEEP="${MAX_CKPT_TO_KEEP:-null}"
+
 python rl_train/verl_jobs/prepare_minecraft_data.py --out "$DATA_DIR" \
-  --train "$TRAIN_BATCH" --val "$TRAIN_BATCH"
+  --train "$TRAIN_BATCH" --val "$VAL_BATCH"
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     data.train_files="$DATA_DIR/train.parquet" \
     data.val_files="$DATA_DIR/test.parquet" \
     data.train_batch_size=$TRAIN_BATCH \
-    data.val_batch_size=$TRAIN_BATCH \
-    data.max_prompt_length=1024 \
+    data.val_batch_size=$VAL_BATCH \
+    data.max_prompt_length=$MAX_PROMPT_LEN \
     data.max_response_length=$MAX_RESPONSE_LEN \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
@@ -128,7 +154,10 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.enforce_eager=True \
     actor_rollout_ref.rollout.free_cache_engine=True \
-    actor_rollout_ref.rollout.val_kwargs.temperature=0.4 \
+    actor_rollout_ref.rollout.val_kwargs.temperature=$VAL_TEMPERATURE \
+    actor_rollout_ref.rollout.val_kwargs.top_p=$VAL_TOP_P \
+    +actor_rollout_ref.rollout.limit_images=$LIMIT_IMAGES \
+    actor_rollout_ref.rollout.max_num_batched_tokens=$MAX_BATCHED_TOKENS \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=$LOGPROB_MICRO_BATCH \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
@@ -138,9 +167,10 @@ python3 -m verl.trainer.main_ppo \
     env.env_name=Minecraft \
     env.seed=0 \
     env.max_steps=$MAX_STEPS_ENV \
-    env.history_length=0 \
+    env.history_length=$HISTORY_LENGTH \
+    env.rollout.train_steps_per_traj=$TRAIN_STEPS_PER_TRAJ \
     env.rollout.n=$GROUP_SIZE \
-    env.minecraft.tasks="$TASKS" \
+    "${_TASK_ARGS[@]}" \
     env.minecraft.difficulty=easy \
     env.minecraft.system_message_tag=text_action \
     env.resources_per_worker.num_cpus=1 \
@@ -151,6 +181,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.n_gpus_per_node=$N_GPUS \
     trainer.nnodes=1 \
     trainer.save_freq=$SAVE_FREQ \
+    trainer.max_actor_ckpt_to_keep=$MAX_CKPT_TO_KEEP \
     trainer.default_local_dir="$CKPT_DIR" \
     "actor_rollout_ref.actor.checkpoint.contents=$_CKPT_CONTENTS" \
     trainer.test_freq=$TEST_FREQ \

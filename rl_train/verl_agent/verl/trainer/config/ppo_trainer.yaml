@@ -305,6 +305,11 @@ env:
     num_gpus: 0
   rollout:
     n: 1 # the group number of envs (for GRPO and GiGPO).
+    # 10-01 新增（Minecraft h29 多轮上下文）：每条训练轨迹最多保留多少个环境步参与
+    # 梯度计算（均匀随机抽取）。0 = 全部保留（原行为）。多图历史下每个样本带 30 张图
+    # 的 pixel_values（约 160MB），全保留会让单步样本量达到 TB 级，必须抽样。
+    # 仅对多轮上下文样本（带 mm_frame_ids）生效；验证时固定只留每条轨迹的最后一步。
+    train_steps_per_traj: 0
   alfworld:
     eval_dataset: eval_in_distribution
   search:
@@ -325,6 +330,7 @@ env:
   minecraft:
     task_name: "mine_block:oak_log"   # 仅在 tasks 为空时作为单任务回退
     tasks: null                       # 任务池：列表或逗号分隔字符串，支持通配（choose_available_task）
+    tasks_file: null                  # 任务池文件（每行一个任务名）；设了则优先于 tasks
     difficulty: easy                  # 与评测 easy-ng 基准一致
     system_message_tag: text_action   # 与评测 SYSTEM_MESSAGE_TAG 一致
     record_path: null                 # 设了才录像（耗磁盘，调试用）

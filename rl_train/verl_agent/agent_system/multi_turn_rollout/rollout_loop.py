@@ -59,6 +59,9 @@ class TrajectoryCollector:
             dict: Contains processed input data such as input_ids, attention_mask, etc.
         """
 
+        if obs.get('chat', None) is not None:
+            return self._preprocess_chat_sample(item, gen_batch, obs)
+
         raw_prompt = gen_batch.non_tensor_batch['raw_prompt'][item]
         data_source = gen_batch.non_tensor_batch['data_source'][item]
         apply_chat_template_kwargs = self.config.data.get("apply_chat_template_kwargs", {})
@@ -187,6 +190,123 @@ class TrajectoryCollector:
         
         return row_dict
 
+    # ------------------------------------------------------------------
+    # 多轮上下文（10-01，Minecraft h29 对齐评测）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _render_chat_messages(struct: Dict, k: int):
+        """按 openha.gen_response 的格式把结构化上下文渲染成消息列表。
+
+        struct = {"prefix": system+instruction, "turns": [(fid, response), ...], "current": fid}
+        k = 使用最近 k 条历史。返回 (messages, frame_ids)，messages 的 content 是带
+        `<image>` 占位的字符串，与 [text, image] 列表形式经 chat template 渲染后逐字一致
+        （text 在前、image 在后；空文本不产生任何字符）。
+        """
+        turns = list(struct["turns"])[-k:] if k > 0 else []
+        messages, fids = [], []
+        for hdx, (fid, response) in enumerate(turns):
+            prefix = struct["prefix"] if hdx == 0 else ""
+            messages.append({"role": "user", "content": prefix + "<image>"})
+            messages.append({"role": "assistant", "content": response})
+            fids.append(fid)
+        messages.append({"role": "user", "content": ("" if turns else struct["prefix"]) + "<image>"})
+        fids.append(struct["current"])
+        return messages, fids
+
+    def _image_grid(self, pil_image):
+        """单张图的 image_grid_thw（按尺寸缓存；Minecraft POV 尺寸固定，只算一次）。"""
+        cache = self.__dict__.setdefault("_grid_cache", {})
+        key = pil_image.size
+        if key not in cache:
+            cache[key] = self.processor.image_processor([pil_image], return_tensors='pt')['image_grid_thw'][0]
+        return cache[key]
+
+    def _expand_image_tokens(self, templated: str, grids) -> str:
+        merge_length = self.processor.image_processor.merge_size ** 2
+        index = 0
+        while '<image>' in templated:
+            templated = templated.replace(
+                '<image>',
+                '<|vision_start|>' + '<|placeholder|>' * int(grids[index].prod() // merge_length) + '<|vision_end|>',
+                1,
+            )
+            index += 1
+        return templated.replace('<|placeholder|>', self.processor.image_token)
+
+    def _preprocess_chat_sample(self, item: int, gen_batch: DataProto, obs: Dict):
+        """多轮上下文样本：最近 H 步 (画面, 回复) + 当前画面。
+
+        与单帧路径的差别：
+          - 不在这里计算 pixel_values（30 张图约 160MB/样本，而绝大多数环境步不会被
+            抽中参与训练）；只记录 `mm_frame_ids`，由 gather_rollout_data 对抽中的
+            样本物化 multi_modal_inputs。vLLM 只需要 multi_modal_data（PIL 图）。
+          - 若展开后超过 max_prompt_length（如历史回复里有长 Thought），从最旧的历史
+            开始逐条丢弃直到放得下，而不是按 truncation='error' 直接中断整个训练。
+        """
+        data_source = gen_batch.non_tensor_batch['data_source'][item]
+        apply_chat_template_kwargs = self.config.data.get("apply_chat_template_kwargs", {})
+        struct = obs['chat'][item]
+        get_frame = obs['get_frame']
+        max_len = self.config.data.max_prompt_length
+
+        n_turns = len(struct["turns"])
+        for k in range(n_turns, -1, -1):
+            messages, fids = self._render_chat_messages(struct, k)
+            templated = self.tokenizer.apply_chat_template(
+                messages, add_generation_prompt=True, tokenize=False, **apply_chat_template_kwargs)
+            images = [get_frame(f) for f in fids]
+            grids = torch.stack([self._image_grid(im) for im in images])
+            prompt_with_chat_template = self._expand_image_tokens(templated, grids)
+            n_tokens = len(self.tokenizer.encode(prompt_with_chat_template, add_special_tokens=False))
+            if n_tokens <= max_len:
+                break
+        else:
+            raise RuntimeError(f"即使不带历史，prompt 仍有 {n_tokens} token，超过 max_prompt_length={max_len}")
+        if k < n_turns:
+            self.__dict__["_n_history_truncated"] = self.__dict__.get("_n_history_truncated", 0) + 1
+            if self._n_history_truncated <= 5 or self._n_history_truncated % 100 == 0:
+                print(f"[rollout] prompt 超长，历史 {n_turns} → {k} 条（累计 {self._n_history_truncated} 次）", flush=True)
+
+        input_ids, attention_mask = verl_F.tokenize_and_postprocess_data(
+            prompt=prompt_with_chat_template, tokenizer=self.tokenizer, max_length=max_len,
+            pad_token_id=self.tokenizer.pad_token_id, left_pad=True, truncation=self.config.data.truncation)
+
+        if "Qwen3VLProcessor" in self.processor.__class__.__name__:
+            from verl.models.transformers.qwen3_vl import get_rope_index
+        else:
+            from verl.models.transformers.qwen2_vl import get_rope_index
+        vision_position_ids = get_rope_index(
+            self.processor, input_ids=input_ids[0], image_grid_thw=grids, attention_mask=attention_mask[0])
+        valid_mask = attention_mask[0].bool()
+        text_position_ids = torch.ones((1, len(input_ids[0])), dtype=torch.long)
+        text_position_ids[0, valid_mask] = torch.arange(valid_mask.sum().item())
+        position_ids = torch.cat((text_position_ids, vision_position_ids), dim=0)  # (4, seq)
+
+        raw_prompt = templated.replace('<image>', '<|vision_start|><|image_pad|><|vision_end|>')
+        raw_prompt_ids = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
+
+        row_dict = {
+            'multi_modal_data': {'image': images},
+            'mm_frame_ids': '|'.join(fids),
+            'input_ids': input_ids[0],
+            'attention_mask': attention_mask[0],
+            'position_ids': position_ids,
+            'raw_prompt_ids': raw_prompt_ids,
+            'anchor_obs': obs['anchor'][item] if obs.get('anchor') is not None else None,
+            'index': item,
+            'data_source': data_source,
+        }
+        if self.config.data.get('return_raw_chat', False):
+            row_dict['raw_prompt'] = messages
+        return row_dict
+
+    def _materialize_mm_inputs(self, record: Dict, get_frame) -> None:
+        """为抽中参与训练的样本计算 pixel_values（与单帧路径 image_processor 调用方式相同）。"""
+        fids = record.pop('mm_frame_ids').split('|')
+        images = [get_frame(f) for f in fids]
+        image_inputs = self.processor.image_processor(images, return_tensors='pt')
+        record['multi_modal_inputs'] = {key: val for key, val in image_inputs.items()}
+
     def preprocess_batch(
         self,
         gen_batch: DataProto, 
@@ -238,9 +358,18 @@ class TrajectoryCollector:
             success: Dict[str, np.ndarray],
             traj_uid: np.ndarray,
             tool_callings: np.ndarray,
+            is_train: bool = True,
+            get_frame=None,
             ) -> DataProto:
         """
         Collect and organize trajectory data, handling batch size adjustments to meet parallel training requirements.
+
+        10-01：对多轮上下文样本（带 mm_frame_ids）先按轨迹抽样再物化 pixel_values：
+          - 训练：每条轨迹均匀随机保留 env.rollout.train_steps_per_traj 步（0=全保留）。
+            稀疏的整局奖励下同一轨迹所有步的优势相同，抽样只降低方差估计的样本量，
+            不改变期望；而且 GRPO 默认按"步"算组内均值/方差，每条轨迹等量抽样反而
+            消除了"失败的长轨迹步数多、主导组内统计"的偏差。
+          - 验证：每条轨迹只留最后一步（验证只需要整局奖励/成功率）。
         
         Parameters:
             total_batch_list (List[List[Dict]): List of trajectory data for each environment
@@ -258,7 +387,28 @@ class TrajectoryCollector:
         for key, value in success.items():
             success_rate[key] = np.mean(value)
         
+        keep_k = int(self.config.env.rollout.get('train_steps_per_traj', 0) or 0)
+        rng = np.random.default_rng()
         effective_batch = []
+        n_active_total = 0
+        for bs in range(batch_size):
+            active = [d for d in total_batch_list[bs] if d['active_masks']]
+            n_active_total += len(active)
+            if active and 'mm_frame_ids' in active[0]:
+                if not is_train:
+                    active = active[-1:]
+                elif keep_k > 0 and len(active) > keep_k:
+                    idx = np.sort(rng.choice(len(active), size=keep_k, replace=False))
+                    active = [active[i] for i in idx]
+                assert get_frame is not None, "多轮上下文样本需要 envs.get_frame 来物化 pixel_values"
+                for d in active:
+                    self._materialize_mm_inputs(d, get_frame)
+            total_batch_list[bs] = active
+        if total_batch_list and total_batch_list[0] and 'multi_modal_inputs' in total_batch_list[0][0] \
+                and n_active_total != sum(len(b) for b in total_batch_list):
+            print(f"[rollout] {'训练' if is_train else '验证'}：{batch_size} 条轨迹共 {n_active_total} 个有效步，"
+                  f"抽样保留 {sum(len(b) for b in total_batch_list)} 个参与{'梯度' if is_train else '打分'}", flush=True)
+
         for bs in range(batch_size):
             # sum the rewards for each data in total_batch_list[bs]
             for data in total_batch_list[bs]:
@@ -534,6 +684,8 @@ class TrajectoryCollector:
             success=total_success,
             traj_uid=total_traj_uid,
             tool_callings=totoal_tool_callings,
+            is_train=is_train,
+            get_frame=getattr(envs, 'get_frame', None),
         )
-        
+
         return gen_batch_output
