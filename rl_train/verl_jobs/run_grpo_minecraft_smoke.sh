@@ -27,8 +27,19 @@ cd "$REPO_ROOT"
 
 MODEL_PATH="${MODEL_PATH:-/local-ssd/model_cache}"
 DATA_DIR="${DATA_DIR:-/local-ssd/verl_data}"
-GROUP_SIZE="${GROUP_SIZE:-4}"
-N_GPUS="${N_GPUS:-2}"
+GROUP_SIZE="${GROUP_SIZE:-2}"   # GRPO 组内相对优势至少需要 2；冒烟取最小值以减少 Malmo 实例数
+N_GPUS="${N_GPUS:-4}"
+# ⚠ 10-01 smoke12/14：9B 全参数 Adam 的 optimizer.step() 峰值约 144G（fp32 主参数
+# 36G + 梯度 36G + exp_avg/exp_avg_sq 72G），**单卡物理上放不下**。而 verl 的
+# param_offload/optimizer_offload 不是 CPU 计算：update_actor 开头会
+# load_fsdp_model_to_gpu + load_fsdp_optimizer 全部搬回 GPU 再 step（见
+# fsdp_workers.py update_actor），只能降低 rollout 阶段的占用，降不了 step 峰值
+# ——smoke14 开了 offload 仍在 Adam _init_group OOM 即为实证。唯一有效手段是
+# FSDP 多卡分片：4 卡时每卡约 36G + vLLM 份额，可放下。
+if [ "$N_GPUS" -lt 4 ]; then
+    echo "[grpo-smoke][WARN] N_GPUS=$N_GPUS < 4：9B 全参数 Adam 的 step 峰值大概率 OOM" \
+         "（offload 不降低 step 峰值，见上方注释）" >&2
+fi
 # ⚠ 09-29：verl 断言 `real_train_batch_size % n_gpus == 0`（rollout batch 要能
 # 均分到各 GPU）。TRAIN_BATCH（任务组数）默认与 N_GPUS 对齐，而非固定 1——
 # grpo-smoke3 实测 TRAIN_BATCH=1 + N_GPUS=2 直接在训练循环起步前断言失败退出。
@@ -39,8 +50,8 @@ TASKS="${TASKS:-mine_block:oak_log}"
 # 却在 actor optimizer.step()（Adam 首次 _init_group）OOM：9B 全参数 Adam 在
 # FSDP 混合精度下需 fp32 主参数 36G + 梯度 36G + exp_avg/exp_avg_sq 72G ≈ 144G，
 # 单卡 140G 本来就放不下，何况 vLLM 还占着 gpu_memory_utilization 那一份。
-# 卡数少于 4 时默认把 actor 参数+优化器状态卸到 CPU（koala 每卡 220G 内存，够放），
-# 慢一些但冒烟只求跑通；≥4 卡时 FSDP 分片后显存够用，默认不卸载。
+# 卡数少于 4 时仍默认开 offload（可降低 rollout 阶段显存占用），但它**解决不了
+# step 峰值**（见 N_GPUS 处注释），<4 卡基本跑不通；≥4 卡 FSDP 分片后默认不卸载。
 if [ "$N_GPUS" -lt 4 ]; then _OFFLOAD_DEFAULT=True; else _OFFLOAD_DEFAULT=False; fi
 ACTOR_PARAM_OFFLOAD="${ACTOR_PARAM_OFFLOAD:-$_OFFLOAD_DEFAULT}"
 ACTOR_OPTIM_OFFLOAD="${ACTOR_OPTIM_OFFLOAD:-$_OFFLOAD_DEFAULT}"
