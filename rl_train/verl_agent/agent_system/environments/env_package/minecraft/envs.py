@@ -202,7 +202,23 @@ class MinecraftWorker:
         if env_action is None:
             env_action = self._noop  # 非法动作按 noop 执行，valid 标志由 projection 负责
 
-        obs, reward, terminated, truncated, info = self.env.step(env_action)
+        try:
+            obs, reward, terminated, truncated, info = self.env.step(env_action)
+        except Exception as e:  # noqa: BLE001
+            # ⚠ 10-01 grpo-small2：某个 Malmo 实例 120s（minerl SOCKTIME）没回包，minerl
+            # 自己的兜底是 `observation_space.sample()` 造一个随机观测——而它在当前
+            # gym/numpy 组合下必炸（`Text.sample() takes 1 positional argument` /
+            # `Cannot convert np.dtype into a dtype`），异常一路冒到 TaskRunner，
+            # **一个 JVM 卡住就让整个训练退出**。这里改为：本局按失败（reward=0）提前
+            # 结束、关掉这个模拟器（下一轮 reset 会重建），训练继续。info 里打
+            # env_error 标记，便于统计频率；频繁出现说明 CPU/内存不够，需减环境数。
+            self.env_errors = getattr(self, "env_errors", 0) + 1
+            print(f"[MinecraftWorker {self.env_id}] step 失败（第 {self.env_errors} 次），"
+                  f"本局按失败结束：{type(e).__name__}: {str(e)[:200]}", flush=True)
+            self._close_sim()
+            self.cur_step += 1
+            self.done = True
+            return self._last_pov, 0.0, True, self._info({"env_error": True})
         self.cur_step += 1
         reward = float(reward)
         if reward > 0:  # 评测同款成功判定：拿到任务奖励即成功并终止
