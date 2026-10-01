@@ -45,7 +45,9 @@ if [ "$N_GPUS" -lt 4 ]; then _OFFLOAD_DEFAULT=True; else _OFFLOAD_DEFAULT=False;
 ACTOR_PARAM_OFFLOAD="${ACTOR_PARAM_OFFLOAD:-$_OFFLOAD_DEFAULT}"
 ACTOR_OPTIM_OFFLOAD="${ACTOR_OPTIM_OFFLOAD:-$_OFFLOAD_DEFAULT}"
 ROLLOUT_GPU_MEM="${ROLLOUT_GPU_MEM:-0.4}"
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# ⚠ 不能设 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True：vLLM 的 sleep-mode
+# 显存池（free_cache_engine=True 依赖的 CuMemAllocator）直接断言二者不兼容
+# （smoke13 实测 AssertionError，pytorch#147851）。显存余量靠上面的 offload 解决。
 
 python rl_train/verl_jobs/prepare_minecraft_data.py --out "$DATA_DIR" \
   --train "$TRAIN_BATCH" --val "$TRAIN_BATCH"
