@@ -35,6 +35,17 @@ N_GPUS="${N_GPUS:-2}"
 TRAIN_BATCH="${TRAIN_BATCH:-$N_GPUS}"  # = 任务组数；总 worker 数 = TRAIN_BATCH*GROUP_SIZE
 MAX_STEPS_ENV="${MAX_STEPS_ENV:-16}"   # 冒烟用短 episode，缩短 rollout 耗时
 TASKS="${TASKS:-mine_block:oak_log}"
+# ⚠ 10-01 grpo-smoke12：rollout→reward→advantage→log_prob→backward 全部走通，
+# 却在 actor optimizer.step()（Adam 首次 _init_group）OOM：9B 全参数 Adam 在
+# FSDP 混合精度下需 fp32 主参数 36G + 梯度 36G + exp_avg/exp_avg_sq 72G ≈ 144G，
+# 单卡 140G 本来就放不下，何况 vLLM 还占着 gpu_memory_utilization 那一份。
+# 卡数少于 4 时默认把 actor 参数+优化器状态卸到 CPU（koala 每卡 220G 内存，够放），
+# 慢一些但冒烟只求跑通；≥4 卡时 FSDP 分片后显存够用，默认不卸载。
+if [ "$N_GPUS" -lt 4 ]; then _OFFLOAD_DEFAULT=True; else _OFFLOAD_DEFAULT=False; fi
+ACTOR_PARAM_OFFLOAD="${ACTOR_PARAM_OFFLOAD:-$_OFFLOAD_DEFAULT}"
+ACTOR_OPTIM_OFFLOAD="${ACTOR_OPTIM_OFFLOAD:-$_OFFLOAD_DEFAULT}"
+ROLLOUT_GPU_MEM="${ROLLOUT_GPU_MEM:-0.4}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 python rl_train/verl_jobs/prepare_minecraft_data.py --out "$DATA_DIR" \
   --train "$TRAIN_BATCH" --val "$TRAIN_BATCH"
@@ -62,13 +73,13 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.kl_loss_coef=0.01 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.actor.fsdp_config.param_offload=False \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
+    actor_rollout_ref.actor.fsdp_config.param_offload=$ACTOR_PARAM_OFFLOAD \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=$ACTOR_OPTIM_OFFLOAD \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.mode=sync \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=$ROLLOUT_GPU_MEM \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.enforce_eager=True \
     actor_rollout_ref.rollout.free_cache_engine=True \
