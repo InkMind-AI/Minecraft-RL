@@ -45,6 +45,11 @@ fi
 # grpo-smoke3 实测 TRAIN_BATCH=1 + N_GPUS=2 直接在训练循环起步前断言失败退出。
 TRAIN_BATCH="${TRAIN_BATCH:-$N_GPUS}"  # = 任务组数；总 worker 数 = TRAIN_BATCH*GROUP_SIZE
 MAX_STEPS_ENV="${MAX_STEPS_ENV:-16}"   # 冒烟用短 episode，缩短 rollout 耗时
+# ⚠ 10-01 smoke15：占位 parquet 只有 TRAIN_BATCH 行 = 恰好 1 个 batch，
+# total_epochs=1 时 dataloader 一轮就耗尽，fit() 在第 1 步后**正常退出**（无报错，
+# Progress 停在 1/2）——total_training_steps 只截断、不补数据。真实 prompt/图像都
+# 来自环境，占位行只决定"每步几组"，所以让 epoch 数 = 目标步数即可（每 epoch 1 步）。
+TOTAL_STEPS="${TOTAL_STEPS:-2}"
 TASKS="${TASKS:-mine_block:oak_log}"
 # ⚠ 10-01 grpo-smoke12：rollout→reward→advantage→log_prob→backward 全部走通，
 # 却在 actor optimizer.step()（Adam 首次 _init_group）OOM：9B 全参数 Adam 在
@@ -120,6 +125,6 @@ python3 -m verl.trainer.main_ppo \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
     trainer.test_freq=-1 \
-    trainer.total_epochs=1 \
-    trainer.total_training_steps=2 \
+    trainer.total_epochs=$TOTAL_STEPS \
+    trainer.total_training_steps=$TOTAL_STEPS \
     trainer.val_before_train=False $@
