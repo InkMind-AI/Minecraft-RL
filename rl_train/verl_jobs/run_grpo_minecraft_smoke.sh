@@ -61,6 +61,33 @@ if [ "$N_GPUS" -lt 4 ]; then _OFFLOAD_DEFAULT=True; else _OFFLOAD_DEFAULT=False;
 ACTOR_PARAM_OFFLOAD="${ACTOR_PARAM_OFFLOAD:-$_OFFLOAD_DEFAULT}"
 ACTOR_OPTIM_OFFLOAD="${ACTOR_OPTIM_OFFLOAD:-$_OFFLOAD_DEFAULT}"
 ROLLOUT_GPU_MEM="${ROLLOUT_GPU_MEM:-0.4}"
+
+# ─── 10-01：从冒烟走向小规模正式训练所需的可调项（默认值 = smoke16 通过时的配置）───
+MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-64}"
+# ppo_mini_batch_size 在 fsdp_workers 里会先 ×rollout.n 再 ÷world_size 得到"每卡每次
+# 优化器更新的样本数"。注意 verl-agent 的样本是**逐环境步**展开的（一条 200 步轨迹 =
+# 200 个样本），所以一次 rollout 会切成很多个 mini batch、做多次优化器更新。
+# 默认 TRAIN_BATCH*GROUP_SIZE，与 smoke16 逐字一致。
+PPO_MINI_BATCH="${PPO_MINI_BATCH:-$((TRAIN_BATCH * GROUP_SIZE))}"
+PPO_MICRO_BATCH="${PPO_MICRO_BATCH:-1}"
+LOGPROB_MICRO_BATCH="${LOGPROB_MICRO_BATCH:-1}"
+PROJECT_NAME="${PROJECT_NAME:-verl_minecraft_smoke}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-grpo_qwen3_5_9b_smoke}"
+SAVE_FREQ="${SAVE_FREQ:--1}"
+TEST_FREQ="${TEST_FREQ:--1}"
+VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-False}"
+# 存档：vendored 版 FSDPCheckpointManager.save_checkpoint **无条件**写每个 rank 的
+# model/optim/extra 分片（fsdp_checkpoint_manager.py:162-185 不看 contents），9B 约
+# 100G+/次，且评测脚本加载不了分片。SAVE_HF=1 时额外追加 'hf_model'：rank0 汇总成
+# 标准 HF 目录 <CKPT_DIR>/global_step_N/actor/huggingface/，可直接给
+# run_backbone_eval.sh 当 MODEL_S3_URI 用。默认落在 /local-ssd（--large-ssd 节点盘
+# 28T），容器结束即回收，需要保留的由调用方自行上传 S3。
+CKPT_DIR="${CKPT_DIR:-/local-ssd/verl_ckpt/$PROJECT_NAME/$EXPERIMENT_NAME}"
+if [ "${SAVE_HF:-0}" = "1" ]; then
+    _CKPT_CONTENTS="['model','optimizer','extra','hf_model']"
+else
+    _CKPT_CONTENTS="['model','optimizer','extra']"
+fi
 # ⚠ 不能设 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True：vLLM 的 sleep-mode
 # 显存池（free_cache_engine=True 依赖的 CuMemAllocator）直接断言二者不兼容
 # （smoke13 实测 AssertionError，pytorch#147851）。显存余量靠上面的 offload 解决。
@@ -75,7 +102,7 @@ python3 -m verl.trainer.main_ppo \
     data.train_batch_size=$TRAIN_BATCH \
     data.val_batch_size=$TRAIN_BATCH \
     data.max_prompt_length=1024 \
-    data.max_response_length=64 \
+    data.max_response_length=$MAX_RESPONSE_LEN \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     data.image_key=images \
@@ -85,15 +112,15 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.trust_remote_code=True \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=False \
-    actor_rollout_ref.actor.ppo_mini_batch_size=$((TRAIN_BATCH * GROUP_SIZE)) \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=$PPO_MINI_BATCH \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=$PPO_MICRO_BATCH \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.01 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=$ACTOR_PARAM_OFFLOAD \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=$ACTOR_OPTIM_OFFLOAD \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=$LOGPROB_MICRO_BATCH \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.mode=sync \
@@ -103,7 +130,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.free_cache_engine=True \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.4 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=$LOGPROB_MICRO_BATCH \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.use_invalid_action_penalty=True \
     actor_rollout_ref.actor.invalid_action_penalty_coef=0.1 \
@@ -119,12 +146,14 @@ python3 -m verl.trainer.main_ppo \
     env.resources_per_worker.num_cpus=1 \
     trainer.critic_warmup=0 \
     trainer.logger=['console'] \
-    trainer.project_name='verl_minecraft_smoke' \
-    trainer.experiment_name='grpo_qwen3_5_9b_smoke' \
+    trainer.project_name=$PROJECT_NAME \
+    trainer.experiment_name=$EXPERIMENT_NAME \
     trainer.n_gpus_per_node=$N_GPUS \
     trainer.nnodes=1 \
-    trainer.save_freq=-1 \
-    trainer.test_freq=-1 \
+    trainer.save_freq=$SAVE_FREQ \
+    trainer.default_local_dir="$CKPT_DIR" \
+    "actor_rollout_ref.actor.checkpoint.contents=$_CKPT_CONTENTS" \
+    trainer.test_freq=$TEST_FREQ \
     trainer.total_epochs=$TOTAL_STEPS \
     trainer.total_training_steps=$TOTAL_STEPS \
-    trainer.val_before_train=False $@
+    trainer.val_before_train=$VAL_BEFORE_TRAIN "$@"
