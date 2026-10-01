@@ -1,4 +1,4 @@
-# verl 迁移调试进展汇总（截至 09-30）
+# verl 迁移调试进展汇总（截至 10-01）
 
 > 本文档是"把 verl 调通"这条主线的执行记录，按时间顺序梳理每一层验收状态、
 > 踩过的坑和修复方式。更偏顶层的迁移设计/规划见 `verl_migration.md`；本文档
@@ -11,7 +11,7 @@
 | **1. 适配器** | verl-agent + qwen3_5 模型后端，真实 9B 权重前向 | ✅ 通过（`verl-c4`，09-27） |
 | **2. 环境接入** | Minecraft/Malmo 环境包 + `MinecraftEnvironmentManager` | ✅ 通过（`verl-env-d5`，09-28） |
 | **2.5 训练/推理共存可行性** | HF 训练 + vLLM 推理能否同进程、权重能否同步 | ✅ 可行（`colocate-p2`，09-28） |
-| **3. GRPO 训练启动** | `verl.trainer.main_ppo` 端到端跑通 rollout→advantage→update | ⏳ 调试中（`grpo-smoke1`→`smoke11`，09-28~09-30，8 个根因已修，`smoke10` 已真正进入训练循环，`smoke11` 排队中） |
+| **3. GRPO 训练启动** | `verl.trainer.main_ppo` 端到端跑通 rollout→advantage→update | ⏳ 调试中（`grpo-smoke1`→`smoke12`，09-28~10-01，9 个根因已修，`smoke11` 已真正起 Malmo，`smoke12` Running 中） |
 | **4. 端到端训练 + 吞吐** | ≥2 个 update step 完整跑通；吞吐/GPU 利用率对比自研线 | ❌ 尚未开始 |
 
 ---
@@ -188,17 +188,19 @@ Pyro4/xmltodict) → ⑥ 逐个 import 复核），是在多轮实测中被迫�
 | `smoke8` | **setup 完整跑完**（`SETUP_VLLMTRAIN_DONE` 打印），但 job 脚本自己**多余的第二次** `conda activate vllmtrain` 又炸：`activate.d/openjdk_activate.sh: target_platform: unbound variable` | 同一类坑的第二次复现：`smoke7` 的局部修法只在"安装那一刻"关 `set -u`，装完立刻恢复，治不了脚本 source 结束后、调用方自己再 activate 一次的场景 | 精简 job 脚本去掉重复 activate；同时把 setup 脚本的修法从"局部关闭"改为"检查 java 之前关闭、之后不再恢复"，一次性兜住所有后续 activate/deactivate |
 | `smoke9` | 提交失败——CLI 升级到 2.4.0 后 `--s3-log` 参数被移除 | 用法过时，不是代码问题 | 改用 `smoke10`（去掉 `--s3-log`） |
 | `smoke10` | 排队 **8 小时+**（集群资源被同 namespace 其他任务占满，配额本身充足）后终于跑起来，**第一次完整通过 setup 和所有此前 7 个坑，真正进入 GRPO 训练循环（Ray dataloader 开始跑）**，撞上第 8 个坑：`AttributeError: '_io.BytesIO' object has no attribute 'startswith'` | verl 自带 `vision_utils.process_image()` 把 `{"bytes": png}` 转成 `image["image"]=BytesIO(...)` 再调 `qwen_vl_utils.fetch_image()`——但 `fetch_image` 只认 `PIL.Image` 或 `str`（http(s):// / file:// / data:image base64 / 本地路径），**完全不支持 BytesIO**，这是 verl-agent 自带代码与当前 `qwen_vl_utils` 版本的不匹配，不是我们的适配层问题 | `prepare_minecraft_data.py` 改为把占位图写成真实 PNG 文件，`images` 列用 `{"image": "file://<path>"}` 代替 `{"bytes": ...}`，绕开这条有 bug 的分支（`file://` 是 `fetch_image` 明确支持的格式，本地已用 pandas/pyarrow round-trip 验证格式不变） |
-| `smoke11` | ⏳ 已提交（`--cluster aws` 排队 #14），提交时又撞上 `koala update` 强制版本门禁（`当前版本2.4.0 已低于平台要求的最低版本2.4.1`），`koala update` 本身因缺 `OSS_ACCESS_KEY_ID/SECRET` 失败；改为从 `s3://arcwm-code-us-west-2/tools/koala/koala-2.4.1-darwin-arm64.tar.gz` 直接下载校验 sha256 后手动替换本地二进制，绕开对 OSS 凭据的依赖 | — | — |
+| `smoke11` | 提交时撞上 `koala update` 强制版本门禁（见下），绕开后**跨过了 dataloader**（`file://` 修复生效），真正推进到 `MinecraftWorker.reset()`（rollout 的真实入口，第一次创建 Malmo 环境），撞上第 9 个坑：`ModuleNotFoundError: No module named 'xmltodict'` | `setup_vllmtrain_env.sh` 第一步 `apt-get install xvfb` 没有先 `apt-get update`，在干净容器里静默失败（输出被 `>/dev/null 2>&1` 吞掉）；缺 xvfb 导致 step⑤ 真实起 Malmo 的探针因 `xvfb-run: command not found` 报错，而这类报错不被 `_install_missing_no_deps` 的三种已知模式（ModuleNotFoundError/ImportError/版本门禁）识别，判定为"无法识别的错误"后放弃——**整个 Malmo 运行时依赖捕获环节被静默跳过**，xmltodict 这种只在真正起 JVM 时才 import 的依赖一路漏到 GRPO 训练才暴露 | 两处修复：① `apt-get update` 前置 + 真实错误输出（不再吞掉），失败有明确 WARN；② 不再把已知运行时依赖的捕获全部押在 step⑤ 的动态探针上，直接前置装好 `xmltodict`/`lxml`/`psutil` 等清单；③ step⑤ 本身在缺 xvfb 时退化为裸 `python`（仍能捕获 import 期错误）而不是静默跳过 |
+| `smoke12` | ⏳ 已提交，**直接 `Running`（集群排队解除，不再需要等待）** | — | — |
 
-前 9 轮修复均已提交并同步到 S3；每轮都是"改代码 → 语法检查 → 提交 → 拉日志
-定位下一个问题"的循环，累计暴露 8 个独立根因（6 个环境/框架兼容性问题 +
-openjdk 的 `set -u` 坑复现两次 + verl 自带图像加载代码的版本不匹配 bug）。
-**`smoke10` 是迄今最重要的里程碑**：不仅环境组装（fla 内核、minestudio、
-真实起一次 Malmo）完整通过，**GRPO 训练循环本身第一次真正跑起来**（Ray
-dataloader 开始工作），问题域已经从"环境/配置能不能起来"彻底转移到
-"训练逻辑内部的数据/模型细节"——这是全新的、更接近终点的问题层级。
-`smoke7`/`smoke8` 是同一个 openjdk 坑的两次不同触发路径，已改为从根上
-（不恢复 `set -u`）解决，理论上不会再犯第三次。
+前 10 轮修复均已提交并同步到 S3/GitHub；每轮都是"改代码 → 语法检查 → 提交 →
+拉日志定位下一个问题"的循环，累计暴露 9 个独立根因（6 个环境/框架兼容性问题 +
+openjdk 的 `set -u` 坑复现两次 + verl 自带图像加载代码的版本不匹配 bug +
+xvfb 静默安装失败连带 Malmo 运行时依赖捕获被跳过）。
+**`smoke10`/`smoke11` 是连续两个里程碑**：`smoke10` 第一次跑进训练循环
+（Ray dataloader 开始工作），`smoke11` 又往前跨了一大步——第一次真正走到
+`MinecraftWorker.reset()`、真实创建 Malmo 环境这一步。问题域已经从
+"环境/配置能不能起来"彻底转移到"训练逻辑内部的数据/环境细节"——这是全新的、
+更接近终点的问题层级。`smoke7`/`smoke8` 是同一个 openjdk 坑的两次不同触发
+路径，已改为从根上（不恢复 `set -u`）解决，理论上不会再犯第三次。
 
 ### 静态审查：提前排查 dataloader 之后的未执行代码（09-30）
 
@@ -283,22 +285,29 @@ dataloader 阶段算出、随后被覆盖的 `input_ids`。记下来避免以后
    代码路径会触发同一类不兼容操作（如再调一次 `conda activate`），必须
    在 sourced 脚本里"从此不再恢复"才能彻底兜住，不能只治第一次触发点
 
-## 当前状态（09-30 深夜，重大突破：训练循环已真正跑起来）
+## 当前状态（10-01，连续突破：已真正起 Malmo，集群排队解除）
 
 `smoke10` 排队超过 8 小时（#21→#19→#15→#12，确认是集群资源被同 namespace
 其他任务占满，非自己的配额/代码问题）后终于开始执行，**第一次完整跑过全部
 setup 和此前 7 个坑，真正进入了 GRPO 训练循环**（Ray dataloader 开始工作），
 在读取占位图片数据时撞上第 8 个坑（verl 自带 `vision_utils.py` 与
-`qwen_vl_utils` 版本不匹配，见上表），已修复并提交 `smoke11`（排队 #14）。
+`qwen_vl_utils` 版本不匹配，见上表），已修复并提交 `smoke11`。
 
-**排队期间探索过的两条绕行方案，均已确认不可行**：
+`smoke11` 又往前跨了一大步：**跨过了 dataloader，真正推进到
+`MinecraftWorker.reset()`——第一次实际创建 Malmo 环境**，撞上第 9 个坑
+（`xmltodict` 缺失，根因是 xvfb 静默安装失败连带整个 Malmo 运行时依赖捕获
+环节被跳过，见上表）。已修复并提交 `smoke12`，**这次直接 `Running`，
+集群排队压力已解除，不再需要等待数小时**。
+
+**排队期间探索过的两条绕行方案，均已确认不可行**（记录供以后参考，不必
+重复尝试）：
 
 1. **迁移到 H20 集群**（完全空闲）——跨云拉 AWS ECR 镜像卡在
    `ContainerCreating` 超 5 分钟，代码/权重都在 AWS S3，暂不具备迁移条件
 2. **debug 模式 + `koala exec`/`koala ssh`**——pod 本身健康，但 cvm→pod
    隧道建立失败（基础设施问题，非本地配置可修），交互式调试路径当前不可用
 
-**期间还处理了两次 koala CLI 版本相关的意外阻塞**：
+**期间还处理了三次 koala CLI 相关的意外阻塞**：
 
 1. **2.3.6→2.4.0**：默认集群改为 H20（AWS 集群需显式加 `--cluster aws`）；
    **`--s3-log` 参数被移除**，此前全程依赖的 `.koala-logs` S3 拉日志方式
@@ -308,20 +317,36 @@ setup 和此前 7 个坑，真正进入了 GRPO 训练循环**（Ray dataloader 
    `s3://arcwm-code-us-west-2/tools/koala/koala-2.4.1-darwin-arm64.tar.gz`
    下载（sha256 校验通过），解压后手动替换 `~/.local/bin/koala` 的软链接
    目标，不依赖 OSS 凭据
+3. **本地 `koala` 命令一度全面报错**`❌ 初始化失败，请联系管理员`——
+   **不是缓存损坏，是残留的 git 锁文件**：`~/.cache/koala-cli/koala-config/`
+   是本地克隆的一个 git 仓库，`.git/refs/heads/master.lock` 残留导致
+   `git fsck` 报 `badRefContent`、完整性校验失败。此前 11 次同类故障都是
+   靠整体删除 `~/.cache/koala-cli` 重建解决（见 `koala-cli.bak*` 的大量
+   备份目录），这次改为精确诊断：`koala doctor` 先定位到
+   `CACHE_INTEGRITY_FAILED`，再用 `git fsck` 找到具体坏在哪个 ref，发现
+   只是锁文件残留，`find .git -name "*.lock" -delete` 即解决，**不需要
+   删除重建整个缓存**——以后遇到同类报错，先试这个更轻量的修法
 
 H20 集群的路径/存储约定也变了（个人持久目录 `/cpfs/<企业ID>`，代码走东京
 OSS）——只有在真正决定迁移 H20 时才需要处理，目前不适用。
 
+## 待实跑验证的静态分析成果（`smoke_step3`，10-01 已全部通过）
+
+09-30 对 dataloader 之后的整条未执行链路做了系统性静态审查（见上文"静态
+审查"小节），修了一个真 bug（`resources_per_worker` 未透传），推翻了两个
+误判（mrope 形状不一致），剩余的唯一真正未知（4 行 mrope 能否走通 Qwen3_5
+前向）打包进 `smoke_step3.py` 一次性验证。**结果：H/I/J/K/L 五层全部通过**，
+最关键的 K 层（`(4,1,231)` 形状的 position_ids 走通 PPO 前向，产出
+`log_probs(1,231)`/`entropy(1,231)`）证实 transformers 5.15 的 Qwen3.5
+确实能接受 4 行 mrope，此前的担忧已清零。
+
 ## 下一步
 
-1. 等 `smoke11` 排队结束并跑完，验证 `file://` 图片路径的修复是否生效、
-   是否还有第 9 个坑（训练循环内部大概率还有别的数据/模型细节问题，
-   `smoke10` 只是刚踏入这一层，不能假设一次就能跑完 2 个完整 update step）
-2. 跑通冒烟后，扩大到真正的小规模训练（≥2 个 update step，非冒烟规模）
-3. 测吞吐/GPU 利用率，对比自研线（HTTP eval-harness rollout）——这是切换
-   决策的核心指标，目前仍是空白
-4. 解决"每样本单图 vs h29 多图历史"的结构性差距，否则 verl 线产出的策略
-   与评测条件不一致，无法做公平的成绩对比
+1. 等 `smoke12` 跑完，确认 Malmo 能否真正 reset 成功、进入 rollout 循环
+   （`smoke_step3` 已验证了前向/形状层面没问题，但环境这一侧——reset 超时、
+   JVM 稳定性等——仍是全新代码路径，需要实跑确认）
+2. 若仍有新坑，继续按同样流程修（成本已显著降低：集群不再排队，一轮
+   迭代预计分钟级而非小时级）
 3. 跑通冒烟后，扩大到真正的小规模训练（≥2 个 update step，非冒烟规模）
 4. 测吞吐/GPU 利用率，对比自研线（HTTP eval-harness rollout）——这是切换
    决策的核心指标，目前仍是空白
