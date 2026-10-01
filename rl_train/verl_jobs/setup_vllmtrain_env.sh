@@ -234,10 +234,28 @@ _assert_torch_unchanged "④minestudio"
 # 之后自己再 activate/deactivate 一次"两种情形。其余逻辑一律用
 # `${VAR:-default}` 写法保证在 nounset 关闭下也不出错（本脚本从头至尾的风格）。
 set +u
+# ⚠ 10-01 grpo-small1：conda-forge 一次网络抖动（ConnectionError: conda.anaconda.org）
+# 让 openjdk 没装上，脚本却照常走完并打出 SETUP_VLLMTRAIN_DONE（结尾只打印了
+# java=MISSING），一直拖到训练前验证阶段 4 个 Malmo worker 全部
+# `xvfb-run: java: not found` 才失败，白跑 20 分钟。现在：conda 重试 3 次 → apt
+# 兜底（xvfb 已证明 apt 源可用）→ 仍没有 java 就立即 FATAL，不带着坏环境往下走。
 if ! command -v java >/dev/null 2>&1; then
-    echo "[setup] installing openjdk=8"
-    conda install --channel=conda-forge openjdk=8 -y -q
+    for _try in 1 2 3; do
+        echo "[setup] installing openjdk=8 via conda-forge（第 $_try 次）"
+        conda install --channel=conda-forge openjdk=8 -y -q && break
+        sleep 15
+    done
 fi
+if ! command -v java >/dev/null 2>&1; then
+    echo "[setup][WARN] conda 装 openjdk 失败，改用 apt 兜底（openjdk-8-jdk-headless）"
+    apt-get update -qq 2>&1 | tail -2 || true
+    apt-get install -y -qq openjdk-8-jdk-headless 2>&1 | tail -3 || true
+fi
+if ! command -v java >/dev/null 2>&1; then
+    echo "[setup][FATAL] java 不可用（conda 与 apt 均失败），Malmo 无法启动，终止" >&2
+    exit 1
+fi
+echo "[setup] java: $(command -v java) ($(java -version 2>&1 | head -1))"
 if ! python -c "from cuda import cuda, cudart" >/dev/null 2>&1; then
     pip install -q --no-deps "cuda-python==12.6.2.post1"
 fi
