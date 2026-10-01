@@ -117,6 +117,13 @@ if [ -n "$TASKS_FILE" ]; then _TASK_ARGS=("env.minecraft.tasks_file=$TASKS_FILE"
 VAL_TEMPERATURE="${VAL_TEMPERATURE:-0.4}"
 VAL_TOP_P="${VAL_TOP_P:-1.0}"
 MAX_CKPT_TO_KEEP="${MAX_CKPT_TO_KEEP:-null}"
+# ⚠ 10-01 train1：h29 下 vLLM 0.17 的多模态处理器缓存（前端 sender ↔ 引擎 receiver
+# 两份按 mm_hash 对齐的 LRU，默认 4GB）在每个请求带 30 张图、且相邻请求大量复用同一批
+# 历史帧时会失步——前端以为某帧已缓存只发 hash，引擎侧已把它淘汰，于是
+# `AssertionError: Expected a cached item for mm_hash=...`，在训练前验证的第一批生成就
+# 炸了。我们的 rollout 是离线 LLM.generate、不存在跨进程重复上传的问题，缓存收益很小，
+# 直接设 0 关掉（每次都完整传图，彻底消除失步）。单帧模式不受影响，也一并关掉。
+MM_PROCESSOR_CACHE_GB="${MM_PROCESSOR_CACHE_GB:-0}"
 
 python rl_train/verl_jobs/prepare_minecraft_data.py --out "$DATA_DIR" \
   --train "$TRAIN_BATCH" --val "$VAL_BATCH"
@@ -158,6 +165,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.val_kwargs.top_p=$VAL_TOP_P \
     +actor_rollout_ref.rollout.limit_images=$LIMIT_IMAGES \
     actor_rollout_ref.rollout.max_num_batched_tokens=$MAX_BATCHED_TOKENS \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.mm_processor_cache_gb=$MM_PROCESSOR_CACHE_GB \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=$LOGPROB_MICRO_BATCH \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
