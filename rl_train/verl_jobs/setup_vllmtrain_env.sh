@@ -25,9 +25,24 @@ source /opt/conda/etc/profile.d/conda.sh
 REPO_ROOT="${REPO_ROOT:-/data/work/run_codes/Minecraft-CoT}"
 cd "$REPO_ROOT"
 
+# ⚠ 09-30 grpo-smoke11 教训：这里原来是 `apt-get install -y -qq xvfb >/dev/null 2>&1`，
+# 没有先 `apt-get update`，在干净容器里必然失败（索引为空），而错误又被
+# `>/dev/null 2>&1` 完全吞掉——于是 xvfb 没装上却毫无提示，连带导致后面
+# step⑤ 的"真实起一次 Malmo"探针因 `xvfb-run: command not found` 被
+# `_install_missing_no_deps` 判为"无法识别的错误"而放弃（它只认
+# ModuleNotFoundError/ImportError/版本门禁三类），**整个 Malmo 运行时依赖
+# 捕获环节被静默跳过**。后果是 xmltodict 这种只在真正启动 JVM 时才 import
+# 的依赖漏装，一路漏到 GRPO 训练里 MinecraftWorker.reset() 才炸，白等一轮
+# 8 小时排队。现在：先 update，失败即明确报错（不再静默），且不再把
+# Malmo 依赖的捕获全部押在 step⑤ 上（见下面的前置安装）。
 if ! command -v xvfb-run >/dev/null 2>&1; then
     echo "[setup] installing xvfb (needed later for the real Malmo boot check)"
-    apt-get install -y -qq xvfb >/dev/null 2>&1
+    apt-get update -qq 2>&1 | tail -2 || true
+    apt-get install -y -qq xvfb 2>&1 | tail -3 || true
+    if ! command -v xvfb-run >/dev/null 2>&1; then
+        echo "[setup][WARN] xvfb 安装失败——step⑤ 的真实 Malmo 冒烟将无法运行，" \
+             "只能依赖下面的前置依赖清单；若 reset() 阶段仍报缺模块，把它补进该清单" >&2
+    fi
 fi
 
 if ! conda env list | grep -qE '^vllm35 '; then
@@ -173,12 +188,27 @@ _assert_torch_unchanged "③verl训练依赖"
 echo "[setup] ④ openagents（--no-deps）+ minestudio（--no-deps + 逐个补依赖）"
 pip install -e . --no-deps -q
 pip install -q --no-deps minestudio
-# Pyro4：minerl 与 Malmo Java 进程通信用的 RPC 库，只在真正 launch 一个 Malmo
-# 实例时才被 import（MinecraftSim() 实例化路径的更深处），不在任何 import 链
-# 探针能覆盖到的静态导入范围内——09-28 trainenv11 实测：D 层过、E 层（真正起
-# Malmo）才炸 `No module named 'Pyro4'`。minerl 生态惯用 4.76（更新版本对 RPC
-# 协议/serializer 有破坏性改动，未验证是否兼容，不冒险装最新版）。
-python -c "import Pyro4" 2>/dev/null || pip install -q --no-deps "Pyro4==4.76" "serpent>=1.41"
+# ─── Malmo/minerl 的「运行时才 import」依赖清单 ────────────────────────────
+# 这些模块只在真正 launch 一个 Malmo 实例时才被 import（`MinecraftSim()` →
+# `env_spec.make()` → `importlib.import_module(entry_point)` → minerl 的
+# `_multiagent.py` 等），**不在任何静态 import 链探针能覆盖的范围内**。
+# 历次实测：trainenv11 炸 Pyro4、trainenv12 炸 xmltodict，而 09-30
+# grpo-smoke11 又一次炸 xmltodict——因为那轮 xvfb 静默没装上，step⑤ 的真实
+# Malmo 冒烟（本该兜住这类依赖）被跳过了，于是一路漏到 GRPO 训练的
+# `MinecraftWorker.reset()` 才暴露，白等一轮 8 小时排队。
+#
+# 教训：**不能把这类依赖的发现全押在 step⑤ 的动态探针上**（它依赖 xvfb、
+# 依赖 JVM 能起、还依赖报错格式可被识别，任一环节出问题就静默放弃）。已知的
+# 一律在这里前置装好，step⑤ 只作为"兜住尚未知依赖"的补充手段。
+# 版本说明：Pyro4 钉 4.76（minerl 生态惯用版本，更新版本对 RPC
+# 协议/serializer 有破坏性改动，未验证兼容性）。
+for _mod_pkg in "Pyro4:Pyro4==4.76" "serpent:serpent>=1.41" "xmltodict:xmltodict" \
+                "lxml:lxml" "psutil:psutil" "jinja2:Jinja2" "requests:requests" \
+                "daemoniker:daemoniker" "coloredlogs:coloredlogs"; do
+    _m="${_mod_pkg%%:*}"; _p="${_mod_pkg##*:}"
+    python -c "import $_m" 2>/dev/null \
+      || { echo "[setup] 前置补装 Malmo 运行时依赖 $_m（$_p）"; pip install -q --no-deps "$_p" 2>&1 | tail -1; }
+done
 # ⚠ 探针必须探到真正会被调用的深层路径，不能只 `import minestudio`：
 # minestudio/__init__.py 本身很浅，不会触发它自己的子模块树（utils.register
 # 需要 absl；utils.vpt_lib.actions 经 action_head 需要 gymnasium，这两条都是
@@ -248,6 +278,16 @@ unset -f _engine_ok
 # 任务 reset+close（不 step，避免额外拉长冒烟时间），失败信息交给
 # _install_missing_no_deps 复用同一套仓库判定+修复逻辑。
 echo "[setup] ⑤ 真实起一次 Malmo（捕获仅运行时触发的依赖，如 Pyro4/xmltodict）"
+# xvfb 装不上时**退化为裸 python 跑**，而不是让整步因 `xvfb-run: command not
+# found` 被判为"无法识别的错误"而静默放弃（09-30 grpo-smoke11 正是这样丢掉了
+# 整个依赖捕获环节）。没有虚拟显示，Malmo 的 JVM 大概率起不来，但**import
+# 阶段的缺失依赖依然会被照常捕获**——而那恰恰是这一步最主要的价值。
+if command -v xvfb-run >/dev/null 2>&1; then
+    _MALMO_RUNNER="xvfb-run -a python"
+else
+    echo "[setup][WARN] 无 xvfb，⑤ 退化为裸 python（仍能捕获 import 期缺失依赖）" >&2
+    _MALMO_RUNNER="python"
+fi
 _install_missing_no_deps "
 from openagents.envs.tasks.task_manager import choose_available_task
 from agent_system.environments.env_package.minecraft.envs import _build_sim
@@ -256,7 +296,7 @@ sim = _build_sim(cfg, record_path=None)
 sim.reset()
 sim.close()
 print('MALMO_BOOT_OK')
-" "xvfb-run -a python"
+" "$_MALMO_RUNNER"
 _assert_torch_unchanged "⑤真实Malmo冒烟"
 
 echo "[setup] ⑥ 逐个验证 import"
