@@ -73,6 +73,18 @@ PPO_MICRO_BATCH="${PPO_MICRO_BATCH:-1}"
 LOGPROB_MICRO_BATCH="${LOGPROB_MICRO_BATCH:-1}"
 PROJECT_NAME="${PROJECT_NAME:-verl_minecraft_smoke}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-grpo_qwen3_5_9b_smoke}"
+# 10-02：wandb 可选接入。只要 WANDB_API_KEY 非空就自动把 wandb 加进
+# trainer.logger（与 console 并存，不互斥），否则保持原来纯 console 行为——
+# 不传 key 的旧调用方式（冒烟脚本的全部历史调用）不受影响。project/name 直接
+# 复用下面已有的 trainer.project_name/experiment_name（tracking.py 的
+# WandbLogger 就是拿这两个做 wandb.init(project=, name=)，不需要额外变量）。
+WANDB_API_KEY="${WANDB_API_KEY:-}"
+if [ -n "$WANDB_API_KEY" ]; then
+    export WANDB_API_KEY
+    LOGGER_BACKENDS="['console','wandb']"
+else
+    LOGGER_BACKENDS="['console']"
+fi
 SAVE_FREQ="${SAVE_FREQ:--1}"
 TEST_FREQ="${TEST_FREQ:--1}"
 VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-False}"
@@ -183,7 +195,7 @@ python3 -m verl.trainer.main_ppo \
     env.minecraft.system_message_tag=text_action \
     env.resources_per_worker.num_cpus=1 \
     trainer.critic_warmup=0 \
-    trainer.logger=['console'] \
+    trainer.logger=$LOGGER_BACKENDS \
     trainer.project_name=$PROJECT_NAME \
     trainer.experiment_name=$EXPERIMENT_NAME \
     trainer.n_gpus_per_node=$N_GPUS \
