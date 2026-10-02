@@ -12,7 +12,7 @@
 | **2. 环境接入** | Minecraft/Malmo 环境包 + `MinecraftEnvironmentManager` | ✅ 通过（`verl-env-d5`，09-28） |
 | **2.5 训练/推理共存可行性** | HF 训练 + vLLM 推理能否同进程、权重能否同步 | ✅ 可行（`colocate-p2`，09-28） |
 | **3. GRPO 冒烟** | `verl.trainer.main_ppo` 端到端跑通 rollout→advantage→update，连续 ≥2 步 | ✅ **通过**（`grpo-smoke16`，10-01，4×GPU，2/2 步；共 16 轮、修 12 个根因） |
-| **4. 正式训练（h29 多图历史 + 真实任务池）** | 解决单图 vs h29 结构性差距，8 卡跑真实 100 步 GRPO | ⏳ **进行中**（`grpo_h29_mixed88_train2`，10-02，8×GPU，已稳定跑完 7/100 步，无中断） |
+| **4. 正式训练（h29 多图历史 + 真实任务池）** | 解决单图 vs h29 结构性差距，8 卡跑真实 100 步 GRPO | ⏳ **两个并行实例在跑**：`grpo_h29_mixed88_train2`（无 wandb，10-02 起已稳定跑完 7/100 步）+ `grpo_h29_mixed88_wandb`（同配置 + wandb，10-02 新开，见下） |
 | **5. 吞吐对比自研线** | 吞吐对比自研 HTTP eval-harness，决定是否切换主线 | ❌ 未开始 |
 
 ---
@@ -499,6 +499,36 @@ TimeoutError: timed out                                    ← comms.recv_messag
 在建组时需要一次重试，无一次真正失败，训练 100% 连续推进到第 7 步，**不是
 需要立即处理的问题**。如果后续这个比例明显上升（例如同时起更多组、换更小的
 机型），才需要考虑降 `GROUP_SIZE`/`TRAIN_BATCH` 或给 Malmo JVM 更长超时。
+
+### 接入 wandb + 16 卡探索（10-02）
+
+**16 卡（跨 2 节点）暂缓**：AWS 集群每节点最多 8 卡，16 卡必须 `-n 2 -g 8`
+跨机。排查发现代码库里**没有任何多机 Ray 配置**——`verl.trainer.main_ppo`
+的 `ray.init()` 是本地初始化（`main_ppo.py:36-48`，无 `address="auto"`），
+`trainer.nnodes` 在 `ppo_trainer.yaml` 和两个训练脚本里都硬编码 `1`，整个
+`rl_train/` 下没有 `ray start --head`/`--address` 的跨机引导脚本。直接提交
+`-n 2` 会让两个节点各自独立跑一份完整训练、互不协同，是全新未验证路径、
+有端口/资源冲突风险。与用户确认后**暂缓多机，改为 8 卡单节点（已验证配置）
++ 接入 wandb**。
+
+**wandb 接入**：`run_grpo_minecraft_smoke.sh` 改为按 `WANDB_API_KEY` 是否
+非空自动决定 `trainer.logger` 是 `['console']` 还是 `['console','wandb']`
+（`tracking.py` 的 `WandbLogger` 直接拿 `trainer.project_name`/
+`experiment_name` 做 `wandb.init(project=, name=)`，不需要额外变量），不传
+key 时旧调用方式完全不受影响。复用 `trl_sft/common.sh` 里现成的 key（同一
+wandb 账号/组织）。
+
+新开任务 `grpo_h29_mixed88_wandb`（8×GPU，与 `train2` 完全同配置，仅
+`EXPERIMENT_NAME`/`WANDB_API_KEY` 不同），立即 `Running`（配额 24 卡，与
+`train2` 的 8 卡并行占用 16 卡，仍有余量），确认日志里 wandb 正常连接：
+
+```
+wandb: 🚀 View run at https://wandb.ai/eter1118-peking-university/verl_minecraft/runs/f4lzg2nn
+```
+
+现在 `grpo_h29_mixed88_train2`（无 wandb）和 `grpo_h29_mixed88_wandb`
+（有 wandb）**两个同配置实例在并行跑**——后者的训练曲线可以直接在上面的
+wandb 链接里看。
 
 ---
 
