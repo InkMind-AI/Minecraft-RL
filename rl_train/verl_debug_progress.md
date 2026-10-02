@@ -1,10 +1,10 @@
-# verl 迁移调试进展汇总（截至 10-01）
+# verl 迁移调试进展汇总（截至 10-02）
 
 > 本文档是"把 verl 调通"这条主线的执行记录，按时间顺序梳理每一层验收状态、
 > 踩过的坑和修复方式。更偏顶层的迁移设计/规划见 `verl_migration.md`；本文档
 > 侧重"实际调试过程中发生了什么、为什么坏、怎么修的"，供后续排错和写作复盘用。
 
-## 总览：四层验收状态
+## 总览：五层验收状态
 
 | 层 | 内容 | 状态 |
 |---|---|---|
@@ -12,7 +12,8 @@
 | **2. 环境接入** | Minecraft/Malmo 环境包 + `MinecraftEnvironmentManager` | ✅ 通过（`verl-env-d5`，09-28） |
 | **2.5 训练/推理共存可行性** | HF 训练 + vLLM 推理能否同进程、权重能否同步 | ✅ 可行（`colocate-p2`，09-28） |
 | **3. GRPO 冒烟** | `verl.trainer.main_ppo` 端到端跑通 rollout→advantage→update，连续 ≥2 步 | ✅ **通过**（`grpo-smoke16`，10-01，4×GPU，2/2 步；共 16 轮、修 12 个根因） |
-| **4. 真实训练 + 吞吐对比** | 解决 reward 稀疏 / 单图历史；吞吐对比自研线 | ❌ 未开始（已有首个吞吐基线：稳态 200s/step、115 token/s/GPU） |
+| **4. 正式训练（h29 多图历史 + 真实任务池）** | 解决单图 vs h29 结构性差距，8 卡跑真实 100 步 GRPO | ⏳ **进行中**（`grpo_h29_mixed88_train2`，10-02，8×GPU，已稳定跑完 7/100 步，无中断） |
+| **5. 吞吐对比自研线** | 吞吐对比自研 HTTP eval-harness，决定是否切换主线 | ❌ 未开始 |
 
 ---
 
@@ -324,15 +325,6 @@ dataloader 阶段算出、随后被覆盖的 `input_ids`。记下来避免以后
    重新开启某个选项（如 `set -u`）只能兜住"这一刻"，若调用方后面还有
    代码路径会触发同一类不兼容操作（如再调一次 `conda activate`），必须
    在 sourced 脚本里"从此不再恢复"才能彻底兜住，不能只治第一次触发点
-7. **verl 的 `param_offload`/`optimizer_offload` 降不了 optimizer step 的峰值**：
-   它只在空闲期把状态挪到 CPU，`update_actor` 开头会全部搬回 GPU 再 step。
-   9B 全参数 Adam 约 144G，必须靠 FSDP 多卡分片（4 卡每卡约 36G）
-8. **`expandable_segments:True` 与 vLLM sleep-mode 显存池不兼容**
-   （`free_cache_engine=True` 时 `CuMemAllocator` 直接断言失败）
-9. **静默失败的安装比报错更危险**：`apt-get install ... >/dev/null 2>&1` 没装上
-   xvfb，连带让后面的依赖探针也静默放弃，问题一路漏到训练阶段才暴露
-10. **koala `初始化失败`** 先查 `~/.cache/koala-cli/koala-config/.git/**/*.lock`
-    残留锁，删掉即可；没有锁时多半是瞬时故障，重试就好，不必整个删缓存
 
 ## 调试过程记录（09-30~10-01：集群排队、CLI 故障与绕行）
 
@@ -409,15 +401,118 @@ koala submit -m normal -j axiomjin-verl-grpo -g 4 --cluster aws --large-ssd -y \
       bash rl_train/verl_jobs/run_grpo_minecraft_smoke.sh"
 ```
 
+## 第 4 层：正式训练——h29 多图历史对齐 + 真实任务池（10-01~10-02，进行中）
+
+### 解决了"下一步"里悬而未决的两项：单图 vs h29、reward 稀疏
+
+**单图 → h29 多图历史**（`MinecraftEnvironmentManager(env.history_length=H>0)`）：
+`verl-agent` 原生 rollout 每步只拼一条"一张图"的 user message，`history_length`
+参数也只回放**文本**观测，两者都对不上评测的"h29 = 30 张图 + 29 条历史回复"多图
+上下文。改为在 `MinecraftEnvironmentManager` 里按 env 维护最近 H 组
+`(frame, response)`，产出结构化 context，`rollout_loop` 按与 `openha.gen_response`
+逐字相同的方式渲染（首轮 user = system+instruction+image，随后每轮
+`(image, response)` 对、文本置空，最后追加当前帧）。已用真实 tokenizer/processor
+在 h=0/1/5/29 四档本地验证渲染结果与评测侧的 `[text, image]` 列表形式逐字节
+一致。
+
+**reward 稀疏 → 换真实任务池**：不再用冒烟的单任务，改用 SFT 起点 v2-e4 在
+easy-h29 评测里"组内有成有败"的 88 个任务（`tasks/mixed_v2e4_easy_h29.txt`）——
+只有组内既有成功又有失败的轨迹，GRPO 优势才非零，这是让冒烟期"pg_loss 退化
+为 0"不再发生的关键前提（而非单纯拉长 episode）。
+
+### 正式训练脚本：`run_grpo_minecraft_train.sh`
+
+在 `run_grpo_minecraft_smoke.sh` 之上包一层，职责分离：
+
+- `HISTORY_LENGTH=29`、真实任务池、`MAX_STEPS_ENV=200`（=评测步数）、
+  `TOTAL_STEPS=100`、`GROUP_SIZE=8 × TRAIN_BATCH=8` = 64 个训练环境 + 16 验证
+- 每条轨迹只抽 `TRAIN_STEPS_PER_TRAJ=4` 步参与梯度（h29 每样本 pixel_values
+  约 155MB，64×200 步全量进显存不现实）
+- 后台每 `UPLOAD_INTERVAL_S=600` 秒把已完整落盘的 HF 格式存档 + `train.log`
+  同步到 S3（`upload_ready_ckpts`，靠 `latest_checkpointed_iteration.txt` 判断
+  "完整"，避免上传半成品；容器意外终止也不会丢训练产物/日志）
+
+### 当前运行状态（`grpo_h29_mixed88_train2`，8×GPU，10-02）
+
+```
+koala submit -m normal -j axiomjin-verl-grpo-h29-train2 -g 8 --cluster aws --large-ssd -y \
+  --code "s3://arcwm-code-us-west-2/axiom/code:/data/work/run_codes" \
+  -c "set -euo pipefail; cd /data/work/run_codes/Minecraft-CoT; \
+      source rl_train/verl_jobs/setup_vllmtrain_env.sh; \
+      export MODEL_PATH=/local-ssd/model_cache; \
+      aws s3 cp s3://arcwm-code-us-west-2/axiom/model/minecraft-sft-stage4-cot-pilot-v2/checkpoint-520/ \
+        /local-ssd/model_cache/ --recursive --exclude 'global_step*' --exclude 'rng_state_*' --exclude 'zero_to_fp32.py' --only-show-errors; \
+      export EXPERIMENT_NAME=grpo_h29_mixed88_train2; \
+      bash rl_train/verl_jobs/run_grpo_minecraft_train.sh"
+```
+
+提交后立即 `Running`（排队问题已随集群负载消退），截至最后检查**已稳定运行
+9h+、连续跑完 7/100 步、无中断、无需人工介入**：
+
+| step | pg_loss | grad_norm | kl_loss | success_rate | valid_action_ratio |
+|---|---|---|---|---|---|
+| 1 | 0.166 | 3.42 | 0.000 | 0.391 | 1.000 |
+| 2 | −0.165 | 4.35 | 0.000 | 0.438 | 1.000 |
+| 3 | 0.069 | 1.25 | 0.000 | 0.438 | 1.000 |
+| 4 | −0.223 | 2.40 | 0.000 | 0.406 | 1.000 |
+| 5 | 0.139 | 2.27 | 0.001 | 0.391 | 1.000 |
+| 6 | −0.110 | 2.17 | 0.000 | 0.359 | 1.000 |
+| 7 | 0.019 | 3.97 | 0.001 | 0.250 | 0.996 |
+
+**这是本次迁移以来第一次看到持续、非零的 GRPO 学习信号**：`pg_loss` 在 7 步内
+正负交替且无爆炸，`success_rate` 在 0.25~0.44 区间波动（而非冒烟期的恒 0）——
+证实换真实任务池解决了 reward 稀疏问题。`timing_s/gen≈2900s`、
+`timing_s/update_actor≈495s`、`timing_s/step≈3600s`（8 卡、h29 多图、200 步/episode、
+64×4=256 梯度样本——规模远大于冒烟，不能直接与 `smoke16` 的吞吐基线比较）。
+
+### 深入分析：worker 侧间歇性报错（已有兜底，未中断训练，非新 bug）
+
+训练日志里出现 7 次 `[MinecraftWorker N] sim 创建失败 1/3`，完整链路：
+
+```
+TimeoutError: timed out                                    ← comms.recv_message 等 JVM 回包超时
+  ↳ TypeError: Text.sample() takes 1 positional argument    ← minestudio 兜底："造一个随机观测"，
+    but 2 were given                                          调 Dict.sample(bs)→Text.sample(bs)，
+                                                                但当前 gym 版本 Text.sample() 不收参数
+    ↳ TypeError: Cannot convert np.dtype into a dtype.        ← 兜底的兜底：改成不传 bs 的 sample()，
+                                                                却在 spaces.py:497 写成
+                                                                np.array(strings, np.dtype)——把 np.dtype
+                                                                这个**类**当 dtype 用，必炸
+```
+
+**根因定位**：最外层是真实的资源竞争——64 训练 + 16 验证 = 80 个 Malmo JVM
+实例同时起/同时 reset，socket 等 JVM 回包时偶发超时（`minerl.env.comms`）。
+**内层两个 `TypeError` 都是 `minestudio`（第三方 vendored 库）自己的异常兜底代码
+在新版 gym/numpy 下的真 bug**（`herobraine/hero/spaces.py`），不是我们代码的问题，
+也不是本次新发现——`envs.py` 里已有对应注释（"10-01 grpo-small2"），说明这条
+坏兜底链此前就踩过，并已针对性加固：
+
+- `reset()`（创建 sim 阶段）：外层 `try/except` 捕获任意异常，重试最多
+  `MAX_SIM_CREATE_ATTEMPTS=3` 次，3 次全失败才真正抛 `RuntimeError`
+- `step()`（episode 进行中）：同样捕获任意异常，不重试，直接把**本局**按失败
+  结束（`reward=0, done=True, info.env_error=True`）、关掉这个模拟器，下一轮
+  `reset()` 重建——绝不让单个卡住的 JVM 拖垂整个训练进程
+
+**实际影响核实**：本次运行中，7 次触发全部发生在 `reset()` 的第 1 次尝试，
+全部在重试后成功（`sim 创建连续失败` 出现 0 次，即没有 worker 用完 3 次重试）；
+`step()` 阶段的兜底分支（`step 失败`）出现 **0 次**。即约 9%（7/80）的 worker
+在建组时需要一次重试，无一次真正失败，训练 100% 连续推进到第 7 步，**不是
+需要立即处理的问题**。如果后续这个比例明显上升（例如同时起更多组、换更小的
+机型），才需要考虑降 `GROUP_SIZE`/`TRAIN_BATCH` 或给 Malmo JVM 更长超时。
+
+---
+
 ## 下一步（从"能跑"到"能用于实验"）
 
-1. **reward 稀疏（最紧迫）**：`smoke16` step 2 的 `pg_loss=0`、`grad_norm=0.06`，
-   原因是 16 步 episode 下所有轨迹 reward≈0，GRPO 组内无方差、没有学习信号。
-   需要加长 `env.max_steps`（评测用 180 帧）、加大 group_n、或加 shaping
-2. **单图 vs h29 多图历史**：`MinecraftEnvironmentManager` 每样本只喂 1 张图，
-   而 SFT/评测都是 h29 多图历史，训练条件与评测不一致，产出的策略无法公平对比
-3. **吞吐对比自研线**：已有首个基线（稳态 200s/step，rollout 107s 占 54%，
-   115 token/s/GPU）；需在相同 episode 长度和组大小下对比自研 HTTP eval-harness
-   rollout，这是切换主线的硬指标（目标 ≥3×）
-4. **显存余量**：每卡峰值 100.9G/140G。episode 加长后 response 序列变长，
-   `update_actor` 的激活显存会上涨，加长 episode 时需要重新确认
+1. **等 `grpo_h29_mixed88_train2` 跑完 100 步**：持续盯 `success_rate`/`pg_loss`
+   走势（是否随训练上升、还是在当前任务池难度下趋于平台）、显存是否随步数增长
+   （目前 100.9G 量级档位是冒烟期数字，h29 多图+更长 episode 下需要重新确认）、
+   以及 worker 侧 `sim 创建失败`/`step 失败` 的频率是否随时间上升
+2. **吞吐对比自研线**：`grpo_h29_mixed88_train2` 的 `timing_s/*` 是在 h29 真实
+   规模下的首个数字（见上），需要在相同 episode 长度/任务难度下对比自研
+   HTTP eval-harness rollout 吞吐，这是切换主线的硬指标（目标 ≥3×）
+3. **训练产物验证闭环**：`global_step_N` 存档已自动上传 S3，下一步应该拿一个
+   存档跑一次 `run_backbone_eval.sh`（和评测用同一套 h29 设置），确认 verl 训出
+   的策略在评测 harness 里分数正常、没有因为两套 rollout 实现的细节差异掉分
+4. ~~单图 vs h29 多图历史~~ ✅ 已解决（见上）
+5. ~~reward 稀疏~~ ✅ 已解决（真实任务池替代单任务冒烟）
