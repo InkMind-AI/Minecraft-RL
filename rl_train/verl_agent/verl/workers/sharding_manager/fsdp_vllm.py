@@ -110,8 +110,73 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         if is_version_ge(pkg='vllm', minver='0.7.3'):
             VLLMHijack.hijack()
 
+        # ⚠ 10-04（grpo_h29 两个 8 卡任务分别在 step 10 / step 25 静默卡死 19~45h）：
+        # verl-agent 的多轮 rollout 每走一步环境就调一次 generate_sequences，每次都
+        # 完整进出本 context manager——上游原版语义是"每次 generate 都把 FSDP 权重
+        # 重新 state_dict() → 逐参数 DTensor.full_tensor()（8 卡 NCCL all-gather）→
+        # vLLM load_weights，结束再 sleep(level=1)"。单轮对话 RL 一个训练步只 generate
+        # 一次，没问题；我们 200 步 episode 就变成**每个训练步 200 次全量权重同步 +
+        # 200 次 sleep/wake**（验证再加 200 次），权重在 rollout 期间根本没变过：
+        #   - 性能：smoke16 单帧 prompt 实测 6.7s/环境步，真正生成 <1s，其余几乎全是
+        #     这套同步；h29 正式训练 14s/环境步里同样有大头是它
+        #   - 稳定性：每个训练步 ~1.3 万轮跨 8 卡集合通信 + CuMemAllocator 反复搬运，
+        #     是两次静默卡死最可疑的位置（无超时的 driver ray.get 会一直等）
+        # 开关 VERL_ROLLOUT_KEEP_AWAKE=1 时：
+        #   ① 权重未变（自上次同步后没有 update_actor/load_checkpoint）就不再同步，
+        #      sleep(level=1) 只是把权重挪到 CPU，wake_up 原样恢复，数值与同步后一致
+        #   ② 连续多次 generate 之间保持 vLLM 唤醒，不 sleep；直到 worker 要跑别的 GPU
+        #      计算（log_prob / ref / update / 存档）时由 worker 调 release() 再 sleep
+        # 显存峰值不变：两次 generate 之间 GPU 上的东西与 generate 进行中完全相同。
+        # 默认关闭（=上游原行为），由训练脚本显式打开。
+        self.keep_awake: bool = os.environ.get("VERL_ROLLOUT_KEEP_AWAKE", "0") == "1"
+        self._weights_dirty: bool = True
+        self._awake: bool = False
+        self._n_full_sync = 0
+        if self.keep_awake:
+            print("[fsdp_vllm] VERL_ROLLOUT_KEEP_AWAKE=1：权重未变时跳过同步，rollout 期间保持唤醒", flush=True)
+
+    def mark_weights_dirty(self):
+        """FSDP 权重发生变化（update_actor / load_checkpoint）后调用。"""
+        self._weights_dirty = True
+
+    def release(self):
+        """把保持唤醒的 vLLM 送回 sleep，给接下来的训练侧 GPU 计算腾显存。"""
+        if not self._awake:
+            return
+        self.inference_engine.sleep(level=1)
+        self._awake = False
+        get_torch_device().empty_cache()
+
     @GPUMemoryLogger(role="fsdp vllm sharding_manager", logger=logger)
     def __enter__(self):
+        if self.keep_awake and vllm_version not in ("0.5.4", "0.6.3"):
+            if self._awake and not self._weights_dirty:
+                # 上一次 generate 之后没 sleep、权重也没变：什么都不用做
+                if self.device_mesh is not None:
+                    self.torch_random_states = get_torch_device().get_rng_state()
+                    get_torch_device().set_rng_state(self.gen_random_states)
+                return
+            if (not self._awake and not self._weights_dirty and self.base_sync_done
+                    and not isinstance(self.module._fsdp_wrapped_module, PeftModel)):
+                # 只是被 release() 送去睡了、权重没变：直接唤醒，跳过全量同步
+                get_torch_device().empty_cache()
+                self.inference_engine.wake_up()
+                self._awake = True
+                if self.device_mesh is not None:
+                    self.torch_random_states = get_torch_device().get_rng_state()
+                    get_torch_device().set_rng_state(self.gen_random_states)
+                return
+            if self._awake:
+                # 权重变了但 vLLM 还醒着（理论上 worker 会先 release，这里兜底）
+                self.release()
+        self._enter_full_sync()
+        self._weights_dirty = False
+        self._awake = True
+        self._n_full_sync += 1
+        if self.keep_awake and torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+            print(f"[fsdp_vllm] 全量权重同步 #{self._n_full_sync}", flush=True)
+
+    def _enter_full_sync(self):
         def __collect_lora_params()->OrderedDict:
             """
             collect lora params or full params if base model is not ready in vllm
@@ -220,8 +285,11 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             "0.6.3",
         ):
             self.inference_engine.offload_model_weights()
+        elif self.keep_awake and exc_type is None:
+            pass  # 保持唤醒，留给下一次 generate；worker 在别的 GPU 计算前调 release()
         else:
             self.inference_engine.sleep(level=1)
+            self._awake = False
 
         self.module.train()
 

@@ -610,8 +610,23 @@ class ActorRolloutRefWorker(Worker):
                 checkpoint_contents=self.config.actor.checkpoint.contents,
             )
 
+    # 10-04：配合 FSDPVLLMShardingManager.keep_awake（VERL_ROLLOUT_KEEP_AWAKE=1）——
+    # rollout 期间 vLLM 在多次 generate 之间保持唤醒，任何训练侧 GPU 计算开始前
+    # 必须先把它送回 sleep 腾显存；FSDP 权重变化后标脏，下次 generate 才重新同步。
+    # 未开启 keep_awake 时 release() 是空操作，行为与上游一致。
+    def _release_rollout_engine(self):
+        mgr = getattr(self, "rollout_sharding_manager", None)
+        if mgr is not None and hasattr(mgr, "release"):
+            mgr.release()
+
+    def _mark_rollout_weights_dirty(self):
+        mgr = getattr(self, "rollout_sharding_manager", None)
+        if mgr is not None and hasattr(mgr, "mark_weights_dirty"):
+            mgr.mark_weights_dirty()
+
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
+        self._release_rollout_engine()
         # Support all hardwares
         data = data.to(get_torch_device().current_device())
 
@@ -651,6 +666,7 @@ class ActorRolloutRefWorker(Worker):
             offload_fsdp_optimizer(optimizer=self.actor_optimizer)
             log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
 
+        self._mark_rollout_weights_dirty()
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
@@ -686,6 +702,7 @@ class ActorRolloutRefWorker(Worker):
     def compute_log_prob(self, data: DataProto):
         # when is_lora is True, we use the actor without lora applied to calculate the log_prob
         # which is mostly used for ref log_prob calculation
+        self._release_rollout_engine()
         assert self._is_actor
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
@@ -734,6 +751,7 @@ class ActorRolloutRefWorker(Worker):
             data = DataProto.from_dict(tensors={'ref_log_prob': data.batch['old_log_probs']})
             return data
         assert self._is_ref
+        self._release_rollout_engine()
         # else:
         # otherwise, the class have a standalone ref model
         # Support all hardwares
@@ -763,6 +781,7 @@ class ActorRolloutRefWorker(Worker):
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
         # only support save and load ckpt for actor
         assert self._is_actor
+        self._release_rollout_engine()
 
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
@@ -800,6 +819,7 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
+        self._release_rollout_engine()
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
@@ -810,6 +830,7 @@ class ActorRolloutRefWorker(Worker):
 
         if self._is_offload_optimizer:
             offload_fsdp_optimizer(self.actor_optimizer)
+        self._mark_rollout_weights_dirty()
 
 
 class CriticWorker(Worker):

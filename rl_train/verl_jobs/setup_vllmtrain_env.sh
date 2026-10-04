@@ -166,6 +166,10 @@ pip install -e rl_train/verl_agent/ --no-deps -q
 pip install -q --no-deps accelerate codetiming datasets dill pandas peft pylatexenc 'ray[default]' \
   'tensordict>=0.8.0,<=0.10.0,!=0.9.0' torchdata wandb qwen-vl-utils pybind11 omegaconf hydra-core gym \
   pyarrow multiprocess einops
+# 10-04：py-spy 是独立二进制 wheel（无 Python 依赖），供 run_grpo_minecraft_train.sh
+# 的卡死看门狗在训练静默挂起时 dump 所有 Ray worker 的调用栈（koala 的 exec/ssh
+# 进不了 normal 任务容器，没有它就只能从日志猜卡在哪）。装失败不影响训练。
+pip install -q --no-deps py-spy || echo "[setup][WARN] py-spy 安装失败，卡死时只能靠 faulthandler 兜底"
 _install_missing_no_deps "import verl, agent_system, gigpo"
 # dp_actor.py 顶层无条件 `from flash_attn.bert_padding import ...`（与
 # attn_implementation 无关，纯 pad/unpad 工具函数）——已在源码里加了不装
