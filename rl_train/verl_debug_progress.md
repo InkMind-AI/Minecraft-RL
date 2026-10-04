@@ -1,4 +1,4 @@
-# verl 迁移调试进展汇总（截至 10-02）
+# verl 迁移调试进展汇总（截至 10-04）
 
 > 本文档是"把 verl 调通"这条主线的执行记录，按时间顺序梳理每一层验收状态、
 > 踩过的坑和修复方式。更偏顶层的迁移设计/规划见 `verl_migration.md`；本文档
@@ -12,7 +12,7 @@
 | **2. 环境接入** | Minecraft/Malmo 环境包 + `MinecraftEnvironmentManager` | ✅ 通过（`verl-env-d5`，09-28） |
 | **2.5 训练/推理共存可行性** | HF 训练 + vLLM 推理能否同进程、权重能否同步 | ✅ 可行（`colocate-p2`，09-28） |
 | **3. GRPO 冒烟** | `verl.trainer.main_ppo` 端到端跑通 rollout→advantage→update，连续 ≥2 步 | ✅ **通过**（`grpo-smoke16`，10-01，4×GPU，2/2 步；共 16 轮、修 12 个根因） |
-| **4. 正式训练（h29 多图历史 + 真实任务池）** | 解决单图 vs h29 结构性差距，8 卡跑真实 100 步 GRPO | ⏳ **两个并行实例在跑**：`grpo_h29_mixed88_train2`（无 wandb，10-02 起已稳定跑完 7/100 步）+ `grpo_h29_mixed88_wandb`（同配置 + wandb，10-02 新开，见下） |
+| **4. 正式训练（h29 多图历史 + 真实任务池）** | 解决单图 vs h29 结构性差距，8 卡跑真实 100 步 GRPO | ⏳ 首轮两个实例分别在 step 10 / step 25 **静默卡死**（10-04 停掉，见"卡死排查"）；验证集已从 0.312 涨到 0.625（step 20）。修复后从 `global_step_20` 续训：`grpo_h29_mixed88_resume20`（10-04 提交，剩余 80 步） |
 | **5. 吞吐对比自研线** | 吞吐对比自研 HTTP eval-harness，决定是否切换主线 | ❌ 未开始 |
 
 ---
@@ -530,19 +530,83 @@ wandb: 🚀 View run at https://wandb.ai/eter1118-peking-university/verl_minecra
 （有 wandb）**两个同配置实例在并行跑**——后者的训练曲线可以直接在上面的
 wandb 链接里看。
 
+### 卡死排查：两个任务都在 rollout 中途静默挂起（10-03~10-04）
+
+**现象**
+
+| 任务 | 最后完成的 step | 卡住时长 | 共同特征 |
+|---|---|---|---|
+| `grpo_h29_mixed88_train2` | 9（卡在 step 10） | ~45h | 日志停在下一轮 rollout 的环境 reset 回调之后，再无任何输出 |
+| `grpo_h29_mixed88_wandb` | 24（卡在 step 25） | ~19.5h | 同上 |
+
+- 没有任何 Traceback / Timeout / OOM，koala 一直显示 `Running`
+- 日志文件仍在被周期性上传，但内容不再增长；10-03 检查时看到"到了 step 24"，实际已经卡住
+- koala 显示的 GPU 利用率是运行期平均值，一直往下掉；按卡住前约 33% 倒推，卡住后实际约 12~14%，接近 1/8，像是只有一张卡还在跑
+- 用 tqdm 时间戳核实：`train2` 的 step 9 在启动后 8h55m 完成，此后 23h+ 再没有 step 10
+
+**已排除**
+
+- **环境 RPC 卡住**：`envs.py` 里 reset/step 的 `ray.get` 都带超时（900s/300s），超时会抛 `GetTimeoutError` 让任务崩掉，不会静默卡几十小时；worker 侧的 `sim 创建连续失败` 一次都没出现
+- **CPU 内存溢出**：`perf/cpu_memory_used_gb` 一直稳定在 770~800G（上限 1760Gi），没有增长
+- **NCCL 死锁 watchdog 应该能兜住**：按 PyTorch 默认设置约 10 分钟会被终止。这一条只是按默认值推断，没有在现场确认
+
+**根因：未能直接确认**。`koala exec` 只支持 debug 任务，进不了 normal 任务的容器抓调用栈。但读代码找到了一个结构性问题，是头号嫌疑点：
+
+- verl-agent 的多轮 rollout（`rollout_loop.py:482-515`）**每走一步环境**就调一次 `actor_rollout_wg.generate_sequences`
+- 每次调用都会完整进出一遍 `FSDPVLLMShardingManager`（`fsdp_workers.py:668`）。上游的设计是：每次 generate 都执行 FSDP `state_dict()` → 对每个参数做 `DTensor.full_tensor()`（8 卡 NCCL all-gather）→ vLLM `load_weights`，结束后再 `sleep(level=1)`
+- 单轮对话 RL 一个训练步只 generate 一次，没问题。我们是 200 步 episode，**一个训练步要做约 200 次全量 9B 权重同步和 200 次 sleep/wake**（每 10 步的验证再加 200 次），而 rollout 期间权重根本没变
+  - **稳定性**：每个训练步约上万轮跨 8 卡集合通信，加上 vLLM `CuMemAllocator` 反复搬运显存。driver 端等 `generate_sequences` 的结果**没有超时**，只要一张卡卡住，整个训练就会一直等下去。这和"只剩一张卡在忙"的现象吻合
+  - **性能**：`smoke16` 单帧短 prompt 实测每个环境步 6.7s，真正的生成不到 1s，其余基本都是这套同步。h29 正式训练每个环境步约 14s，其中同样有一大块是它
+
+**修复**（commit `71b8582`）
+
+1. **`fsdp_vllm.py`**：新增开关 `VERL_ROLLOUT_KEEP_AWAKE=1`（默认关闭，关闭时行为与上游一致）
+   - 权重没变（上次同步之后没有 `update_actor`/`load_checkpoint`）就跳过同步。`sleep(level=1)` 只是把权重挪到 CPU，`wake_up` 后原样恢复，数值与同步后一致
+   - 连续多次 generate 之间保持 vLLM 唤醒，不 sleep
+   - 显存峰值不变：两次 generate 之间 GPU 上的内容和 generate 进行中完全一样
+   - rank0 打印 `[fsdp_vllm] 全量权重同步 #N`，用于实跑核对。预期每个训练步只同步一次（有验证的步是两次），而不是 200 次
+2. **`fsdp_workers.py`**：在 `compute_log_prob` / `compute_ref_log_prob` / `update_actor` / `save_checkpoint` / `load_checkpoint` 开头调 `release()`，先让 vLLM sleep 腾出显存；在 `update_actor` / `load_checkpoint` 结束时标记权重已变，下一次 generate 就只做一次全量同步。ref 一定在 `old_log_prob` 之后执行（`ray_trainer.py:1143` → `1181`），所以 ref 计算时 vLLM 已经释放
+3. **`run_grpo_minecraft_train.sh` 卡死看门狗**（不管上面的修复是否真正命中根因，都能兜底）
+   - 超过 `STALL_TIMEOUT_S`（默认 3h，约为正常一步的 3 倍）没有出现新的 `step:N` 行，就判定卡死
+   - 先抓现场：用 `py-spy dump --native` 抓所有 `WorkerDict`/`TaskRunner`/`MinecraftWorker` 的调用栈；抓不到就发 SIGABRT，配合 `PYTHONFAULTHANDLER=1` 把栈打进 Ray 日志。连同 `nvidia-smi`、`ps`、Ray 日志压缩包、日志末尾 3000 行，一起传到 S3 的 `hang_diag_<时间>/`
+   - 然后杀掉整套进程（main_ppo / Ray / Malmo JVM / Xvfb），用同一个 `CKPT_DIR` 重新拉起。`trainer.resume_mode=auto` 会从本地最新的 FSDP 存档（含优化器状态）续跑，最多丢 `SAVE_FREQ`=10 步
+   - 重启时跳过训练前验证；固定 `WANDB_RUN_ID`，重启后续写同一条 wandb 曲线
+   - 连续 3 次重启仍卡死，以退出码 124 结束任务，不再空转
+4. **`setup_vllmtrain_env.sh`**：装上 `py-spy`，供看门狗使用
+
+**没做到的验证**：看门狗原计划先在本地用假训练进程模拟"卡死 → 抓现场 → 重启"全流程，两次都因为本地命令审批超时没跑成，只做了逐行静态复核。`KEEP_AWAKE` 的效果也要等实跑日志里的同步次数和 `timing_s/gen` 才能确认。
+
+**卡死前的训练效果**（`grpo_h29_mixed88_wandb`，24 步）
+
+- 验证集 `val/success_rate`：**0.312（训练前）→ 0.375（step 10）→ 0.625（step 20）**。验证集只有 16 个环境，噪声大，但涨幅明显
+- 训练集 `episode/success_rate`：前 5 步均值 0.475 → 后 5 步均值 0.610。对 step 线性回归的斜率是 +0.011/步，但标准差 0.165，24 步内统计上不显著
+- `grad_norm` 从 6.35 降到 1.3~3.3，`kl_loss` 基本在 0.00~0.03，`entropy_loss` 从 0.34 降到约 0.20，`valid_action_ratio` 全程 100%，没有发散迹象
+- S3 上保留了两份 HF 存档：`grpo_h29_mixed88_wandb/global_step_10/`、`global_step_20/`（每份 35GB，fp32）。本地的 FSDP 分片存档已随容器回收
+
+**GPU 利用率低的原因**（与卡死无关，正常运行时也只有约 30%）：rollout（`timing_s/gen`，约 2850s）占单步总时长的 78%，真正吃满 GPU 的 `update_actor`（约 508s）只占 14%。rollout 慢有三个原因：
+- Malmo 每一步都要等 JVM 物理模拟和渲染完成
+- h29 下 prompt 平均 6722 token、每步只生成 15.5 token（prefill:decode ≈ 435:1），而且 `mm_processor_cache_gb=0`，每步都要完整重新 prefill
+- `enforce_eager=True` 关掉了 CUDA graph
+
+上面的权重同步问题，可能是这 78% 里比例最大的一块。
+
+### 续训：`grpo_h29_mixed88_resume20`（10-04 提交）
+
+- koala 任务名 `axiomjin-grpo-h29-resume20-normal-20261004-210836`（8×GPU）。原定的 `-j axiomjin-verl-grpo-h29-resume20` 超过了 koala 29 字符的前缀上限，已缩短
+- 起点：`MODEL_PATH` = S3 上的 `grpo_h29_mixed88_wandb/global_step_20/`（HF 格式）。配置与首轮一致，`TOTAL_STEPS=80`，凑满总共 100 步。新任务的 step 编号从 1 重新开始，对应首轮的 step 21 起
+- 代价：丢掉了优化器状态（Adam 动量），本地 FSDP 分片已随容器回收，无法恢复。lr=1e-6 下影响不大
+- 已开启 `VERL_ROLLOUT_KEEP_AWAKE=1`、卡死看门狗和 wandb（run id 为 `grpoh29mixed88resume20`）
+- 第一步要看的东西：
+  1. `[fsdp_vllm] 全量权重同步 #N` 的增长速度：每个训练步应该只 +1（有验证的步 +2）
+  2. `timing_s/gen` 是否明显低于首轮的约 2850s
+  3. 训练前验证的 `val/success_rate` 是否接近 step 20 时的 0.625
+
 ---
 
 ## 下一步（从"能跑"到"能用于实验"）
 
-1. **等 `grpo_h29_mixed88_train2` 跑完 100 步**：持续盯 `success_rate`/`pg_loss`
-   走势（是否随训练上升、还是在当前任务池难度下趋于平台）、显存是否随步数增长
-   （目前 100.9G 量级档位是冒烟期数字，h29 多图+更长 episode 下需要重新确认）、
-   以及 worker 侧 `sim 创建失败`/`step 失败` 的频率是否随时间上升
-2. **吞吐对比自研线**：`grpo_h29_mixed88_train2` 的 `timing_s/*` 是在 h29 真实
-   规模下的首个数字（见上），需要在相同 episode 长度/任务难度下对比自研
-   HTTP eval-harness rollout 吞吐，这是切换主线的硬指标（目标 ≥3×）
-3. **训练产物验证闭环**：`global_step_N` 存档已自动上传 S3，下一步应该拿一个
-   存档跑一次 `run_backbone_eval.sh`（和评测用同一套 h29 设置），确认 verl 训出
-   的策略在评测 harness 里分数正常、没有因为两套 rollout 实现的细节差异掉分
+1. **盯 `grpo_h29_mixed88_resume20`**：先确认上面三项。之后关注 `val/success_rate` 走势、看门狗是否触发。一旦触发，S3 的 `hang_diag_*/` 里就有调用栈，可以直接定位卡死的真正位置
+2. **训练产物验证闭环**：拿 `global_step_20`（以及续训后的存档）跑一次 `run_backbone_eval.sh`，用和评测同一套 h29 设置，确认 verl 训出的策略在评测 harness 里分数正常，没有因为两套 rollout 实现的细节差异掉分
+3. **吞吐对比自研线**：在相同 episode 长度和任务难度下，对比自研 HTTP eval-harness 的 rollout 吞吐，这是切换主线的硬指标（目标 ≥3×）。要用修复同步问题之后的数字来比
 4. ~~单图 vs h29 多图历史~~ ✅ 已解决（见上）
 5. ~~reward 稀疏~~ ✅ 已解决（真实任务池替代单任务冒烟）
