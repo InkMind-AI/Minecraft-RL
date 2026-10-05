@@ -662,6 +662,52 @@ wandb 链接里看。
 | `exp_skipdone` | `axiomjin-grpo-skipdone-normal-20261005-145442` | `SKIP_DONE=1` | `resume20` step 1~3：gen 2180/2160/2323s |
 | `exp_skipdone_mmcache` | `axiomjin-grpo-skipmmc-normal-20261005-145515` | `SKIP_DONE=1` + `MM_PROCESSOR_CACHE_GB=4`，重新打开多模态缓存 | 同上；首轮曾因该缓存失步报 `Expected a cached item for mm_hash`，这次验证 `KEEP_AWAKE` 下是否仍会出现 |
 
+**实验结果**（10-05，两个任务都跑完 3 步、正常退出）：
+
+| 指标（3 步平均） | 基线 `resume20` step 1~3 | `skipdone` | `skipdone + mmcache` |
+|---|---|---|---|
+| `timing_s/gen` | 2221s | 1766s（**−20%**） | 1465s（**−34%**） |
+| `timing_s/step` | 2890s | 2456s（−15%） | 2141s（**−26%**，约 36 分钟/步） |
+| 实际生成行数 / 全量行数 | 12800/12800 | 59~72% | 57~70% |
+| `update_actor` / `old_log_prob` / `ref` | 483 / 94 / 91s | 497 / 97 / 95s | 488 / 96 / 92s |
+| `rollout_probs_diff_mean` | 0.002 | 0.002 | 0.002 |
+| `mm_hash` 断言 / OOM | 0 / 0 | 0 / 0 | **0** / 0 |
+
+- 三组的 `rollout_probs_diff_mean` 相同，熵和回复长度也在同一水平，说明两项改动都没有改变生成结果的分布
+- 多模态缓存在训练 rollout 中没再报错，但**验证路径还没测**：这次实验关了验证，而首轮的 `mm_hash` 报错正是在训练前验证的第一批生成就出现的。正式启用前，要先开着验证跑一次
+
+**rollout 分段计时**（`[rollout-timing]`，单次训练 rollout，`skipdone + mmcache`）：
+
+| 段 | 耗时 | 说明 |
+|---|---|---|
+| `prep`（拼 prompt） | 396~430s | 主进程单线程，每个环境步约 2s：为 64 个环境渲染 h29 对话、分词约 6000 token、计算 rope 位置。**已结束的环境也照样处理** |
+| `gen`（vLLM 生成） | 591~746s | 含 driver ↔ 8 个 worker 的数据传输 |
+| `env`（Malmo 步进） | **29~34s** | 每个环境步只有约 0.15s |
+| 其他（`timing_s/gen` 减去以上三段） | 约 320s | 轨迹整理、抽中的 256 个样本物化 pixel_values 等 |
+
+**更正之前的判断**：之前认为 GPU 在等 Minecraft，实测 Malmo 一整次 rollout 只花约 30s，**不是瓶颈**。GPU 空等的主要原因是主进程上的 CPU 单线程工作（`prep` + 其他，合计约 740s，占 rollout 的一半）。GPU 采样也印证了这一点：每 30s 一次、共约 2000 个样本，**平均利用率 28~29%，中位数 0%**，只有约 30% 的样本超过 50%。
+
+**下一步可做的提速**（还没实现）：
+- `prep` 也跳过已结束的环境：预计 `prep` 再省约 40%
+- 按环境增量缓存已渲染的对话和 token：h29 每一步只新增一轮，不必整段重新渲染、重新分词
+- 多线程或多进程并行拼 prompt
+
+### ⚠ 续训验证集成功率持续下滑（10-05）
+
+| | step 0（起点 = 首轮 step 20） | step 10 | step 20 |
+|---|---|---|---|
+| `val/success_rate` | 0.812 | 0.562 | **0.250** |
+| `actor/entropy_loss`（前后几步） | 0.20 | 约 0.55 | 约 0.34~0.71 |
+| `response_length/mean` | 14.7 | 约 29 | 约 20~27（多次撞 128 上限） |
+
+- **训练集成功率没有崩**：step 3~24 均值约 0.47，首轮均值 0.51。`grad_norm` 2~5.4，`kl_loss` ≤0.05
+- **不能确定是退化**：验证集只有 16 个环境，而且每次验证随机抽不同任务，难度差异很大。同一份 step 20 权重，首轮测出 0.625、续训起点测出 0.812，可见噪声在 ±0.2 量级。但 0.81→0.56→0.25 连续下滑，加上熵和回复长度同时上升，都是需要警惕的信号
+- **排查过的可能原因**：
+  1. `KEEP_AWAKE` 导致 vLLM 用了旧权重：可能性低。`rollout_probs_diff_mean` 始终是 0.002，同步次数与训练步数一一对应
+  2. 跨环境步复用前缀缓存：可能性低。`KEEP_AWAKE` 之前，每次 generate 前都会重置 KV cache；现在一次 rollout 内的前缀缓存可以跨环境步复用（这可能也是提速的来源之一）。Qwen3.5 的混合注意力在 vLLM 里要求 `mamba cache mode='align'`；但如果缓存状态有错，vLLM 的 logprob 应该会和训练侧明显不一致，而实测并没有
+  3. 续训的参考模型变成了 step 20 的策略、Adam 状态重新初始化：两者都会改变训练动态，单凭这些数据分不清
+- **最有说服力的判断方法**：在固定任务集上用评测 harness（`run_backbone_eval.sh`）对比 SFT 起点 v2-e4、首轮 `global_step_20`、续训 `global_step_10/20` 这几个存档，不再依赖 16 个随机验证环境
+
 ---
 
 ## 下一步（从"能跑"到"能用于实验"）
