@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import time
 import torch
 import numpy as np
 from verl import DataProto
@@ -478,10 +480,23 @@ class TrajectoryCollector:
         episode_lengths = np.zeros(batch_size, dtype=np.float32)
         episode_rewards = np.zeros(batch_size, dtype=np.float32)
         tool_callings = np.zeros(batch_size, dtype=np.float32)
+        # ⚠ 10-05：已结束的环境不再参与生成（VERL_ROLLOUT_SKIP_DONE=1）。上游每个环境步都给
+        # 全部 batch_size 个环境生成，循环一直跑到最长的那条轨迹结束——h29 实测有效步只占
+        # 53~58%，近一半生成算力花在已结束的环境上（它们的 prompt 同样带完整的 30 图历史）。
+        # 开启后只把未结束的行送进 vLLM，再按原位置拼回：已结束行复用第一条活跃行的输出
+        # 占位（prompt/response 都补齐到固定长度，形状一致）。这些行 active_masks=False，
+        # 不进训练、不计 reward，环境侧 MinecraftWorker 对已结束的局直接回放终态，所以
+        # 占位内容不影响任何结果。默认关闭（=上游行为）。
+        skip_done = os.environ.get("VERL_ROLLOUT_SKIP_DONE", "0") == "1"
+        _t_prep = _t_gen = _t_env = 0.0
+        _gen_rows = 0
+        _n_steps = 0
         # Trajectory collection loop
         for _step in range(self.config.env.max_steps):
             active_masks = np.logical_not(is_done)
+            _n_steps += 1
 
+            _t0 = time.perf_counter()
             batch = self.preprocess_batch(gen_batch=gen_batch, obs=obs)
 
             batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
@@ -498,12 +513,30 @@ class TrajectoryCollector:
             )
 
             batch_input.meta_info = gen_batch.meta_info
+            _t1 = time.perf_counter()
+            _t_prep += _t1 - _t0
 
-            # pad to be divisible by dp_size
-            batch_input_padded, pad_size = pad_dataproto_to_divisor(batch_input, actor_rollout_wg.world_size)
-            batch_output_padded = actor_rollout_wg.generate_sequences(batch_input_padded)
-            # # unpad
-            batch_output = unpad_dataproto(batch_output_padded, pad_size=pad_size)
+            active_idx = np.nonzero(active_masks)[0]
+            if skip_done and 0 < len(active_idx) < batch_size:
+                sub_input = batch_input[active_idx]
+                sub_input.meta_info = gen_batch.meta_info
+                sub_padded, pad_size = pad_dataproto_to_divisor(sub_input, actor_rollout_wg.world_size)
+                sub_output = unpad_dataproto(actor_rollout_wg.generate_sequences(sub_padded), pad_size=pad_size)
+                # 第 i 行取 sub_output 中的位置：活跃行取自己，已结束行取第 0 条活跃行占位
+                src = np.zeros(batch_size, dtype=np.int64)
+                src[active_idx] = np.arange(len(active_idx))
+                batch_output = sub_output[src]
+                batch_output.meta_info = sub_output.meta_info
+                _gen_rows += len(sub_padded)
+            else:
+                # pad to be divisible by dp_size
+                batch_input_padded, pad_size = pad_dataproto_to_divisor(batch_input, actor_rollout_wg.world_size)
+                batch_output_padded = actor_rollout_wg.generate_sequences(batch_input_padded)
+                # # unpad
+                batch_output = unpad_dataproto(batch_output_padded, pad_size=pad_size)
+                _gen_rows += len(batch_input_padded)
+            _t2 = time.perf_counter()
+            _t_gen += _t2 - _t1
 
             batch.non_tensor_batch['uid'] = uid_batch
             batch.non_tensor_batch['traj_uid'] = traj_uid
@@ -512,7 +545,9 @@ class TrajectoryCollector:
             
             text_actions = self.tokenizer.batch_decode(batch.batch['responses'], skip_special_tokens=True)
             
+            _t3 = time.perf_counter()
             next_obs, rewards, dones, infos = envs.step(text_actions)
+            _t_env += time.perf_counter() - _t3
 
             
             if len(rewards.shape) == 2:
@@ -553,7 +588,14 @@ class TrajectoryCollector:
             # Break if all environments are done
             if is_done.all():
                 break
-        
+
+        # 分段计时：prep=拼 prompt（CPU）、gen=vLLM 生成（含 driver↔worker 传输）、
+        # env=Malmo 执行动作并回传画面。三者相加≈timing_s/gen
+        _split = 'train' if getattr(getattr(envs, 'envs', None), 'is_train', True) else 'val'
+        print(f"[rollout-timing] {_split} "
+              f"env_steps={_n_steps} prep={_t_prep:.0f}s gen={_t_gen:.0f}s env={_t_env:.0f}s "
+              f"gen_rows={_gen_rows}/{_n_steps * batch_size} skip_done={int(skip_done)}", flush=True)
+
         success: Dict[str, np.ndarray] = envs.success_evaluator(
                     total_infos=total_infos,
                     total_batch_list=total_batch_list,

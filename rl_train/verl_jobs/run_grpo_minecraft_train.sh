@@ -86,7 +86,16 @@ upload_ready_ckpts() {
         fi
     done
     aws s3 cp "$LOG" "$S3_OUT/train.log" --only-show-errors 2>/dev/null || true
+    [ -f "$GPU_CSV" ] && aws s3 cp "$GPU_CSV" "$S3_OUT/gpu_util.csv" --only-show-errors 2>/dev/null || true
 }
+
+# 10-05：每 GPU_SAMPLE_S 秒记一次各卡利用率/显存（koala 面板只给全生命周期平均值，
+# 分不清 rollout 和 update 各阶段的真实利用率）
+GPU_CSV="$CKPT_DIR/gpu_util.csv"
+GPU_SAMPLE_S="${GPU_SAMPLE_S:-30}"
+nvidia-smi --query-gpu=timestamp,index,utilization.gpu,memory.used --format=csv,noheader,nounits \
+    -l "$GPU_SAMPLE_S" >> "$GPU_CSV" 2>/dev/null &
+GPU_MON_PID=$!
 
 count_steps() {
     local n
@@ -186,7 +195,7 @@ done
 wait "$TRAIN_PID"
 TRAIN_RC=$?
 sleep 5
-kill "$TAIL_PID" 2>/dev/null || true
+kill "$TAIL_PID" "$GPU_MON_PID" 2>/dev/null || true
 upload_ready_ckpts
 echo "[grpo-train] 训练进程退出码 $TRAIN_RC；看门狗重启 $RESTARTS 次；已上传：$(ls "$CKPT_DIR"/.uploaded_* 2>/dev/null | sed 's/.*_//' | tr '\n' ' ')"
 echo GRPO_TRAIN_DONE
