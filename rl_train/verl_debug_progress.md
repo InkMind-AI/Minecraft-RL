@@ -624,6 +624,44 @@ wandb 链接里看。
 
 **卡死是否解决**：两个首轮任务分别跑了 9 步、24 步才卡住，目前只跑了 2 步，还不能下结论。但即使再次卡死，看门狗也会在 3 小时内抓现场并自动续跑。
 
+**10-05 更新：已跑到 19/80 步，没有卡死**（`train2` 当初在 step 10 就卡住了，这次已经越过；首轮 `wandb` 卡在 step 25，还没到）。权重同步次数 = `#20`，与 19 个训练步 + 1 次验证完全对应。`step 失败` 4 次、`sim 创建失败` 12 次，都已被兜底，看门狗未触发。`global_step_10` 存档已上传 S3。
+
+**⚠ 训练质量出现与首轮相反的趋势（原因待查）**：
+
+| 指标 | 首轮 `wandb` step 1→24 | 续训 `resume20` step 1→19 |
+|---|---|---|
+| `actor/entropy_loss` | 0.34 → 约 0.20，逐渐下降 | **0.20 → 约 0.57，持续上升** |
+| `response_length/mean` | 17.6 → 约 15 | **14.7 → 约 27** |
+| `response_length/max` | 21~76 | 多次撞到 **128 上限**（被截断） |
+| `actor/grad_norm` | 1.3~3.3 | 2.0~5.4 |
+| 训练集 `success_rate` | 均值 0.51 | step 1~2 为 0.61/0.77，step 3~19 均值约 0.45 |
+| 验证集 `val/success_rate` | 0.312 → 0.375 → 0.625 | **0.812（起点）→ 0.562（step 10）** |
+| `rollout_probs_diff_mean` | 0.002 | 0.002 |
+
+- 最后一行说明 vLLM 生成时用的权重和训练侧一致，`KEEP_AWAKE` 跳过同步**没有**造成 off-policy
+- 还不能判定是退化：验证集只有 16 个环境，噪声大。但熵上升、回复变长、撞上长度上限是常见的 GRPO 不稳定信号
+- 与首轮相比可能有关的差异：
+  1. 续训的参考模型 = `MODEL_PATH` = step 20 的策略，而不是 SFT 起点，KL 的锚点变了
+  2. Adam 状态重新初始化。首轮也是从零开始的，所以单凭这一点解释不了
+  3. 同样的配置，在已经训练过 20 步的策略上继续训练。需要等 step 20 的验证结果，以及 wandb 曲线再判断
+
+### 方案 B 提速实验（10-05）
+
+**改动**（commit `89ffbbb`，默认关闭，不影响正在跑的续训）：
+
+1. **`VERL_ROLLOUT_SKIP_DONE=1`**（`rollout_loop.py`）：每个环境步只把未结束的环境送进 vLLM 生成，结果再按原位置拼回。已结束的行复用第一条活跃行的输出占位，prompt/response 都补齐到固定长度，形状一致。这些行 `active_masks=False`，不参与训练、不计 reward；环境侧对已结束的局直接回放终态，所以占位内容不影响结果。拼回时 batch 和生成输出没有重叠的 key，不会触发 `union` 的一致性断言
+2. **rollout 分段计时**：每次 rollout 结束打印一行 `[rollout-timing] train|val env_steps= prep= gen= env= gen_rows=已生成行数/全量行数`，把 `timing_s/gen` 拆成拼 prompt / vLLM 生成 / Malmo 步进三段
+3. **GPU 利用率采样**：训练脚本后台每 30s 记一次各卡 `utilization.gpu` 和显存，写入 `gpu_util.csv`，随 `train.log` 一起上传 S3
+
+**方案 B 第三项（关闭 `enforce_eager`）做不了**：`vllm_rollout_spmd.py:107` 断言 `enforce_eager=False` 时必须 `free_cache_engine=False`，也就是不能让 vLLM sleep。那样 vLLM 会在训练阶段一直占着约 56G 显存（`gpu_memory_utilization=0.4`），加上训练峰值 88G，超过 140G，会 OOM。
+
+**对比实验**：两个 8 卡任务，都从 `global_step_20` 起步，配置与 `resume20` 相同，`env.seed=0` 也相同，所以 step 1 抽到的任务和 `resume20` 的 step 1 一致，可以直接对比。各跑 3 步，不做验证、不存档：
+
+| 任务 | koala 名 | 区别 | 对照 |
+|---|---|---|---|
+| `exp_skipdone` | `axiomjin-grpo-skipdone-normal-20261005-145442` | `SKIP_DONE=1` | `resume20` step 1~3：gen 2180/2160/2323s |
+| `exp_skipdone_mmcache` | `axiomjin-grpo-skipmmc-normal-20261005-145515` | `SKIP_DONE=1` + `MM_PROCESSOR_CACHE_GB=4`，重新打开多模态缓存 | 同上；首轮曾因该缓存失步报 `Expected a cached item for mm_hash`，这次验证 `KEEP_AWAKE` 下是否仍会出现 |
+
 ---
 
 ## 下一步（从"能跑"到"能用于实验"）
