@@ -1,4 +1,4 @@
-# verl 迁移调试进展汇总（截至 10-07）
+# verl 迁移调试进展汇总
 
 > 本文档是"把 verl 调通"这条主线的执行记录，按时间顺序梳理每一层验收状态、
 > 踩过的坑和修复方式。更偏顶层的迁移设计/规划见 `verl_migration.md`；本文档
@@ -8,20 +8,20 @@
 
 | 层 | 内容 | 状态 |
 |---|---|---|
-| **1. 适配器** | verl-agent + qwen3_5 模型后端，真实 9B 权重前向 | ✅ 通过（`verl-c4`，09-27） |
-| **2. 环境接入** | Minecraft/Malmo 环境包 + `MinecraftEnvironmentManager` | ✅ 通过（`verl-env-d5`，09-28） |
-| **2.5 训练/推理共存可行性** | HF 训练 + vLLM 推理能否同进程、权重能否同步 | ✅ 可行（`colocate-p2`，09-28） |
-| **3. GRPO 冒烟** | `verl.trainer.main_ppo` 端到端跑通 rollout→advantage→update，连续 ≥2 步 | ✅ **通过**（`grpo-smoke16`，10-01，4×GPU，2/2 步；共 16 轮、修 12 个根因） |
-| **4. 正式训练（h29 多图历史 + 真实任务池）** | 解决单图 vs h29 结构性差距，8 卡跑真实 100 步 GRPO | ⏳ 续训 `resume20` 已到 **61/80**（总第 81 步），预计 10-08 凌晨跑完。卡死根因已缩小到"单卡 vLLM 前向 kernel 永不结束"（见"看门狗首次触发"），看门狗兜底有效。固定任务集评测 3 个存档进行中（见"当前状态"） |
-| **4.5 RL 是否真的提升成绩** | 在固定任务集上和 SFT 起点（28.9%）对比 | ⏳ 评测中（`eval-vg-t20/t40/t70`，10-07 提交） |
+| **1. 适配器** | verl-agent + qwen3_5 模型后端，真实 9B 权重前向 | ✅ 通过（`verl-c4`） |
+| **2. 环境接入** | Minecraft/Malmo 环境包 + `MinecraftEnvironmentManager` | ✅ 通过（`verl-env-d5`） |
+| **2.5 训练/推理共存可行性** | HF 训练 + vLLM 推理能否同进程、权重能否同步 | ✅ 可行（`colocate-p2`） |
+| **3. GRPO 冒烟** | `verl.trainer.main_ppo` 端到端跑通 rollout→advantage→update，连续 ≥2 步 | ✅ **通过**（`grpo-smoke16`，4×GPU，2/2 步；共 16 轮、修 12 个根因） |
+| **4. 正式训练（h29 多图历史 + 真实任务池）** | 解决单图 vs h29 结构性差距，8 卡跑真实 100 步 GRPO | ⏳ 续训 `resume20` 已到 **61/80**（总第 81 步），预计还需约 17 小时。卡死根因已缩小到"单卡 vLLM 前向 kernel 永不结束"（见"看门狗首次触发"），看门狗兜底有效。固定任务集评测 3 个存档进行中（见"当前状态"） |
+| **4.5 RL 是否真的提升成绩** | 在固定任务集上和 SFT 起点（28.9%）对比 | ⏳ 评测中（`eval-vg-t20/t40/t70`） |
 | **5. 吞吐对比自研线** | 吞吐对比自研 HTTP eval-harness，决定是否切换主线 | ❌ 未开始（verl 侧已有数据：每步约 47~53 分钟，rollout 占约 77%） |
 
-## 当前状态（10-07 01:50 UTC）
+## 当前状态
 
 | 任务 | 状态 | 说明 |
 |---|---|---|
-| `axiomjin-grpo-h29-resume20` | 运行中，**61/80**，约 50 分钟/步，剩约 17h | 从 10-05 那次看门狗重启之后没再卡死。`global_step_10`~`60` 都已上传 S3 |
-| `axiomjin-eval-vg-t20` | 运行中（10-07 09:22 +08 提交） | 首轮 `global_step_20`，总第 20 步 |
+| `axiomjin-grpo-h29-resume20` | 运行中，**61/80**，约 50 分钟/步，剩约 17h | 自那次看门狗重启之后没再卡死。`global_step_10`~`60` 都已上传 S3 |
+| `axiomjin-eval-vg-t20` | 运行中 | 首轮 `global_step_20`，总第 20 步 |
 | `axiomjin-eval-vg-t40` | 运行中 | 续训 `global_step_20`，总第 40 步 |
 | `axiomjin-eval-vg-t70` | 运行中 | 续训 `global_step_50`，总第 70 步 |
 
@@ -36,7 +36,7 @@
 
 ---
 
-## 第 1 层：适配器验收（09-27，`verl-c4`，已通过）
+## 第 1 层：适配器验收（`verl-c4`，已通过）
 
 验证 verl-agent 内嵌的 qwen3_5 适配器能否用真实 stage3/v2 权重跑通 PPO 前向。
 
@@ -65,7 +65,7 @@ C 层此前失败四轮，**全部是冒烟脚本自身的 bug，与 verl 无关
 
 ---
 
-## 第 2 层：Minecraft 环境接入（09-28，`verl-env-d5`，已通过）
+## 第 2 层：Minecraft 环境接入（`verl-env-d5`，已通过）
 
 ### 起点问题：之前"已注册"的 minecraft 分支从未真正跑过一步
 
@@ -135,7 +135,7 @@ SMOKE2_RESULT: D,E,F,G (4/4) ✅ 通过
 
 ---
 
-## 第 2.5 层：训练/推理共存可行性（09-28，`colocate-p2`，已确认可行）
+## 第 2.5 层：训练/推理共存可行性（`colocate-p2`，已确认可行）
 
 ### 背景：版本矩阵冲突
 
@@ -170,7 +170,7 @@ V5 HF→vLLM 权重同步回路: state_dict 760 张量 → load_weights 加载 6
 
 ---
 
-## 第 3 层：GRPO 冒烟（09-28~10-01，`grpo-smoke16` 通过）
+## 第 3 层：GRPO 冒烟（`grpo-smoke16` 通过）
 
 ### 环境组装：`setup_vllmtrain_env.sh`
 
@@ -262,7 +262,7 @@ xvfb 静默安装失败连带 Malmo 运行时依赖捕获被跳过）。
 更接近终点的问题层级。`smoke7`/`smoke8` 是同一个 openjdk 坑的两次不同触发
 路径，已改为从根上（不恢复 `set -u`）解决，理论上不会再犯第三次。
 
-### 静态审查：提前排查 dataloader 之后的未执行代码（09-30）
+### 静态审查：提前排查 dataloader 之后的未执行代码
 
 每轮真实冒烟要等 ~8 小时集群排队，逐个试错不可接受，因此对
 `smoke10` 崩点之后的整条链路（rollout loop → env manager → projection →
@@ -352,7 +352,7 @@ dataloader 阶段算出、随后被覆盖的 `input_ids`。记下来避免以后
    一次，开销就放大了 episode 长度倍（200×）。接别人的多轮框架时，要先数清楚
    每个训练步里各个重操作各执行了几次
 
-## 调试过程记录（09-30~10-01：集群排队、CLI 故障与绕行）
+## 调试过程记录（集群排队、CLI 故障与绕行）
 
 `smoke10` 排队超过 8 小时（#21→#19→#15→#12，确认是集群资源被同 namespace
 其他任务占满，非自己的配额/代码问题）后终于开始执行，**第一次完整跑过全部
@@ -397,9 +397,9 @@ setup 和此前 7 个坑，真正进入了 GRPO 训练循环**（Ray dataloader 
 H20 集群的路径/存储约定也变了（个人持久目录 `/cpfs/<企业ID>`，代码走东京
 OSS）——只有在真正决定迁移 H20 时才需要处理，目前不适用。
 
-## 静态分析成果的实跑验证（`smoke_step3`，10-01 全部通过）
+## 静态分析成果的实跑验证（`smoke_step3`，全部通过）
 
-09-30 对 dataloader 之后的整条未执行链路做了系统性静态审查（见上文"静态
+此前对 dataloader 之后的整条未执行链路做了系统性静态审查（见上文"静态
 审查"小节），修了一个真 bug（`resources_per_worker` 未透传），推翻了两个
 误判（mrope 形状不一致），剩余的唯一真正未知（4 行 mrope 能否走通 Qwen3_5
 前向）打包进 `smoke_step3.py` 一次性验证。**结果：H/I/J/K/L 五层全部通过**，
@@ -407,7 +407,7 @@ OSS）——只有在真正决定迁移 H20 时才需要处理，目前不适用
 `log_probs(1,231)`/`entropy(1,231)`）证实 transformers 5.15 的 Qwen3.5
 确实能接受 4 行 mrope，此前的担忧已清零。
 
-## 当前状态（10-01）：冒烟验收通过
+## 冒烟验收通过
 
 `grpo-smoke16` 在 4×GPU 上**连续跑完 2 个完整 GRPO update step**：真实 Malmo
 rollout → reward → GRPO advantage → old/ref log_prob → backward → optimizer
@@ -427,7 +427,7 @@ koala submit -m normal -j axiomjin-verl-grpo -g 4 --cluster aws --large-ssd -y \
       bash rl_train/verl_jobs/run_grpo_minecraft_smoke.sh"
 ```
 
-## 第 4 层：正式训练——h29 多图历史对齐 + 真实任务池（10-01~10-02，进行中）
+## 第 4 层：正式训练——h29 多图历史对齐 + 真实任务池（进行中）
 
 ### 解决了"下一步"里悬而未决的两项：单图 vs h29、reward 稀疏
 
@@ -458,7 +458,7 @@ easy-h29 评测里"组内有成有败"的 88 个任务（`tasks/mixed_v2e4_easy_
   同步到 S3（`upload_ready_ckpts`，靠 `latest_checkpointed_iteration.txt` 判断
   "完整"，避免上传半成品；容器意外终止也不会丢训练产物/日志）
 
-### 当前运行状态（`grpo_h29_mixed88_train2`，8×GPU，10-02）
+### 当前运行状态（`grpo_h29_mixed88_train2`，8×GPU）
 
 ```
 koala submit -m normal -j axiomjin-verl-grpo-h29-train2 -g 8 --cluster aws --large-ssd -y \
@@ -510,7 +510,7 @@ TimeoutError: timed out                                    ← comms.recv_messag
 实例同时起/同时 reset，socket 等 JVM 回包时偶发超时（`minerl.env.comms`）。
 **内层两个 `TypeError` 都是 `minestudio`（第三方 vendored 库）自己的异常兜底代码
 在新版 gym/numpy 下的真 bug**（`herobraine/hero/spaces.py`），不是我们代码的问题，
-也不是本次新发现——`envs.py` 里已有对应注释（"10-01 grpo-small2"），说明这条
+也不是本次新发现——`envs.py` 里已有对应注释（"grpo-small2"），说明这条
 坏兜底链此前就踩过，并已针对性加固：
 
 - `reset()`（创建 sim 阶段）：外层 `try/except` 捕获任意异常，重试最多
@@ -526,7 +526,7 @@ TimeoutError: timed out                                    ← comms.recv_messag
 需要立即处理的问题**。如果后续这个比例明显上升（例如同时起更多组、换更小的
 机型），才需要考虑降 `GROUP_SIZE`/`TRAIN_BATCH` 或给 Malmo JVM 更长超时。
 
-### 接入 wandb + 16 卡探索（10-02）
+### 接入 wandb + 16 卡探索
 
 **16 卡（跨 2 节点）暂缓**：AWS 集群每节点最多 8 卡，16 卡必须 `-n 2 -g 8`
 跨机。排查发现代码库里**没有任何多机 Ray 配置**——`verl.trainer.main_ppo`
@@ -556,7 +556,7 @@ wandb: 🚀 View run at https://wandb.ai/eter1118-peking-university/verl_minecra
 （有 wandb）**两个同配置实例在并行跑**——后者的训练曲线可以直接在上面的
 wandb 链接里看。
 
-### 卡死排查：两个任务都在 rollout 中途静默挂起（10-03~10-04）
+### 卡死排查：两个任务都在 rollout 中途静默挂起
 
 **现象**
 
@@ -566,7 +566,7 @@ wandb 链接里看。
 | `grpo_h29_mixed88_wandb` | 24（卡在 step 25） | ~19.5h | 同上 |
 
 - 没有任何 Traceback / Timeout / OOM，koala 一直显示 `Running`
-- 日志文件仍在被周期性上传，但内容不再增长；10-03 检查时看到"到了 step 24"，实际已经卡住
+- 日志文件仍在被周期性上传，但内容不再增长；某次检查时看到"到了 step 24"，实际已经卡住
 - koala 显示的 GPU 利用率是运行期平均值，一直往下掉；按卡住前约 33% 倒推，卡住后实际约 12~14%，接近 1/8，像是只有一张卡还在跑
 - 用 tqdm 时间戳核实：`train2` 的 step 9 在启动后 8h55m 完成，此后 23h+ 再没有 step 10
 
@@ -616,7 +616,7 @@ wandb 链接里看。
 
 上面的权重同步问题，可能是这 78% 里比例最大的一块。
 
-### 续训：`grpo_h29_mixed88_resume20`（10-04 提交）
+### 续训：`grpo_h29_mixed88_resume20`
 
 - koala 任务名 `axiomjin-grpo-h29-resume20-normal-20261004-210836`（8×GPU）。原定的 `-j axiomjin-verl-grpo-h29-resume20` 超过了 koala 29 字符的前缀上限，已缩短
 - 起点：`MODEL_PATH` = S3 上的 `grpo_h29_mixed88_wandb/global_step_20/`（HF 格式）。配置与首轮一致，`TOTAL_STEPS=80`，凑满总共 100 步。新任务的 step 编号从 1 重新开始，对应首轮的 step 21 起
@@ -627,7 +627,7 @@ wandb 链接里看。
   2. `timing_s/gen` 是否明显低于首轮的约 2850s
   3. 训练前验证的 `val/success_rate` 是否接近 step 20 时的 0.625
 
-**前两步实测结果**（10-04，启动后 2h37m）：
+**前两步实测结果**（启动后 2h37m）：
 
 | 检查项 | 结果 |
 |---|---|
@@ -643,7 +643,7 @@ wandb 链接里看。
 
 **卡死是否解决**：两个首轮任务分别跑了 9 步、24 步才卡住，目前只跑了 2 步，还不能下结论。但即使再次卡死，看门狗也会在 3 小时内抓现场并自动续跑。
 
-**10-05 更新：已跑到 19/80 步，没有卡死**（`train2` 当初在 step 10 就卡住了，这次已经越过；首轮 `wandb` 卡在 step 25，还没到）。权重同步次数 = `#20`，与 19 个训练步 + 1 次验证完全对应。`step 失败` 4 次、`sim 创建失败` 12 次，都已被兜底，看门狗未触发。`global_step_10` 存档已上传 S3。
+**更新：已跑到 19/80 步，没有卡死**（`train2` 当初在 step 10 就卡住了，这次已经越过；首轮 `wandb` 卡在 step 25，还没到）。权重同步次数 = `#20`，与 19 个训练步 + 1 次验证完全对应。`step 失败` 4 次、`sim 创建失败` 12 次，都已被兜底，看门狗未触发。`global_step_10` 存档已上传 S3。
 
 **⚠ 训练质量出现与首轮相反的趋势（原因待查）**：
 
@@ -664,7 +664,7 @@ wandb 链接里看。
   2. Adam 状态重新初始化。首轮也是从零开始的，所以单凭这一点解释不了
   3. 同样的配置，在已经训练过 20 步的策略上继续训练。需要等 step 20 的验证结果，以及 wandb 曲线再判断
 
-### 方案 B 提速实验（10-05）
+### 方案 B 提速实验
 
 **改动**（commit `89ffbbb`，默认关闭，不影响正在跑的续训）：
 
@@ -681,7 +681,7 @@ wandb 链接里看。
 | `exp_skipdone` | `axiomjin-grpo-skipdone-normal-20261005-145442` | `SKIP_DONE=1` | `resume20` step 1~3：gen 2180/2160/2323s |
 | `exp_skipdone_mmcache` | `axiomjin-grpo-skipmmc-normal-20261005-145515` | `SKIP_DONE=1` + `MM_PROCESSOR_CACHE_GB=4`，重新打开多模态缓存 | 同上；首轮曾因该缓存失步报 `Expected a cached item for mm_hash`，这次验证 `KEEP_AWAKE` 下是否仍会出现 |
 
-**实验结果**（10-05，两个任务都跑完 3 步、正常退出）：
+**实验结果**（两个任务都跑完 3 步、正常退出）：
 
 | 指标（3 步平均） | 基线 `resume20` step 1~3 | `skipdone` | `skipdone + mmcache` |
 |---|---|---|---|
@@ -711,7 +711,7 @@ wandb 链接里看。
 - 按环境增量缓存已渲染的对话和 token：h29 每一步只新增一轮，不必整段重新渲染、重新分词
 - 多线程或多进程并行拼 prompt
 
-### ⚠ 续训验证集成功率持续下滑（10-05）
+### ⚠ 续训验证集成功率持续下滑
 
 | | step 0（起点 = 首轮 step 20） | step 10 | step 20 |
 |---|---|---|---|
@@ -727,9 +727,9 @@ wandb 链接里看。
   3. 续训的参考模型变成了 step 20 的策略、Adam 状态重新初始化：两者都会改变训练动态，单凭这些数据分不清
 - **最有说服力的判断方法**：在固定任务集上用评测 harness（`run_backbone_eval.sh`）对比 SFT 起点 v2-e4、首轮 `global_step_20`、续训 `global_step_10/20` 这几个存档，不再依赖 16 个随机验证环境
 
-**10-07 更新：下滑没有持续，主要是验证噪声**。`val/success_rate` 依次为 0.812 → 0.562 → 0.250 → **0.812 → 0.812** → 0.500（step 0~50）。`entropy_loss` 从 step 30 的约 0.68 回落到 step 40~51 的 0.28~0.47，`response_length/mean` 回到约 16~17，`response_length/max` 不再撞 128 上限。训练集成功率 step 40~51 均值约 0.66，首轮均值 0.51。step 20 的 0.250 更像是抽到了一批难任务。不过仍建议用固定任务集评测来确认，见"下一步"。
+**更新：下滑没有持续，主要是验证噪声**。`val/success_rate` 依次为 0.812 → 0.562 → 0.250 → **0.812 → 0.812** → 0.500（step 0~50）。`entropy_loss` 从 step 30 的约 0.68 回落到 step 40~51 的 0.28~0.47，`response_length/mean` 回到约 16~17，`response_length/max` 不再撞 128 上限。训练集成功率 step 40~51 均值约 0.66，首轮均值 0.51。step 20 的 0.250 更像是抽到了一批难任务。不过仍建议用固定任务集评测来确认，见"下一步"。
 
-### 看门狗首次触发：拿到了卡死现场（10-05 20:57）
+### 看门狗首次触发：拿到了卡死现场
 
 续训任务在 step 27 的 rollout 中卡死。看门狗按设计处理：
 
@@ -761,7 +761,7 @@ wandb 链接里看。
 2. **给单次 generate 加超时**：driver 端等 `generate_sequences` 改成带超时的 `ray.get`，超时直接让任务退出，交给看门狗重启。比现在先等 3 小时再处理快得多，但仍会丢掉自上次存档以来的进度
 3. **现在的看门狗能兜底**：约每 20 步卡一次，每次损失约 3~8 小时。对 100 步规模的训练可以接受，长期训练就必须根治
 
-### 10-07 准备：固定任务集评测 + 下一轮训练的改动
+### 准备：固定任务集评测 + 下一轮训练的改动
 
 #### ① 固定任务集评测（已提交）
 
@@ -793,7 +793,7 @@ wandb 链接里看。
 | prefix caching 改为可配置 | `vllm_rollout_spmd.py`，脚本变量 `ENABLE_PREFIX_CACHING` | `True`（不变） | 设为 `False` 做卡死对照。参数从 `engine_kwargs` 里取出后再传给 `LLM()`，避免"同一个参数传了两次"的报错 |
 | 单次 generate 超时 | `single_controller/ray/base.py`，环境变量 `VERL_GENERATE_TIMEOUT_S` | 训练脚本设为 900s | driver 等 `generate_sequences` 超时后打印 `[GENERATE_TIMEOUT]`，再等 `VERL_GENERATE_TIMEOUT_GRACE_S`（900s）才退出，留时间让看门狗趁卡住的 worker 还活着抓栈 |
 | 看门狗响应更快 | `run_grpo_minecraft_train.sh` | 每 30s 检查一次（上传仍是每 10 分钟） | 看到 `[GENERATE_TIMEOUT]` 立即抓现场并重启；训练进程已经因超时退出时同样重启。**卡死后的空转时间从约 3h 降到约 15 分钟** |
-| 跳过已结束的环境 | `VERL_ROLLOUT_SKIP_DONE` | 训练脚本改为默认 `1` | 已在 10-05 实验中验证：rollout −20%，生成分布不变 |
+| 跳过已结束的环境 | `VERL_ROLLOUT_SKIP_DONE` | 训练脚本改为默认 `1` | 已在方案 B 实验中验证：rollout −20%，生成分布不变 |
 
 - **多模态缓存（`MM_PROCESSOR_CACHE_GB=4`）暂不默认打开**：验证阶段的生成路径还没测过，而首轮的 `mm_hash` 报错正是出在训练前验证的第一批生成上。需要开着验证单独跑一次确认
 - **正在跑的 `resume20` 不受影响**：koala 只在容器启动时从 S3 拉一次代码，看门狗在容器内重启时用的仍是旧代码
@@ -808,7 +808,7 @@ wandb 链接里看。
 ## 下一步（从"能跑"到"能用于实验"）
 
 1. **看 `eval-vg-t20/t40/t70` 的结果**：和基线 28.9% 对比，分别统计 88 个训练任务和 114 个训练外任务。超过评测噪声（约 ±1.7pp），才能说 RL 确实有效
-2. **`resume20` 跑完后**（预计 10-08 凌晨）：提交 `global_step_80` 的评测（`EXP=grpo_h29_mixed88_resume20 STEP=80 TOTAL_STEP=100`），凑齐 20/40/70/100 四个点的成绩曲线
+2. **`resume20` 跑完后**：提交 `global_step_80` 的评测（`EXP=grpo_h29_mixed88_resume20 STEP=80 TOTAL_STEP=100`），凑齐 20/40/70/100 四个点的成绩曲线
 3. **下一轮训练**（根据评测结果决定是否继续训练）：配置 `ENABLE_PREFIX_CACHING=False` + `SKIP_DONE=1` + generate 超时，验证卡死是否消失。另外要开着验证跑一次，确认多模态缓存在验证阶段也不出错，之后才能把它设为默认（rollout 可再降约 14%）
 4. **继续给 rollout 提速**：`prep`（拼 prompt）是现在最大的 CPU 瓶颈，每次 rollout 约 415s。可以跳过已结束环境的 prompt 处理、增量渲染对话
 5. **吞吐对比自研线**：在相同 episode 长度和任务难度下，对比自研 HTTP eval-harness 的 rollout 吞吐，这是切换主线的硬指标（目标 ≥3×）。要用修复同步问题之后的数字来比
