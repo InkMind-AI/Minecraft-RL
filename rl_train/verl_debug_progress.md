@@ -708,40 +708,6 @@ wandb 链接里看。
   3. 续训的参考模型变成了 step 20 的策略、Adam 状态重新初始化：两者都会改变训练动态，单凭这些数据分不清
 - **最有说服力的判断方法**：在固定任务集上用评测 harness（`run_backbone_eval.sh`）对比 SFT 起点 v2-e4、首轮 `global_step_20`、续训 `global_step_10/20` 这几个存档，不再依赖 16 个随机验证环境
 
-**10-07 更新：下滑没有持续，主要是验证噪声**。`val/success_rate` 依次为 0.812 → 0.562 → 0.250 → **0.812 → 0.812** → 0.500（step 0~50）。`entropy_loss` 从 step 30 的约 0.68 回落到 step 40~51 的 0.28~0.47，`response_length/mean` 回到约 16~17，`response_length/max` 不再撞 128 上限。训练集成功率 step 40~51 均值约 0.66，首轮均值 0.51。step 20 的 0.250 更像是抽到了一批难任务。不过仍建议用固定任务集评测来确认，见"下一步"。
-
-### 看门狗首次触发：拿到了卡死现场（10-05 20:57）
-
-续训任务在 step 27 的 rollout 中卡死。看门狗按设计处理：
-
-1. 无进展 10814s（阈值 3h）后判定卡死
-2. 抓现场并上传 `grpo_h29_mixed88_resume20/hang_diag_1005_205704/`
-3. 杀掉进程，从本地 `global_step_20` 的 FSDP 存档（含优化器状态）自动续跑，跳过训练前验证
-
-代价：step 21~26 重跑了一遍，加上 3h 判定期，共损失约 8.5h。之后一直正常推进到 step 51。
-
-**现场证据**：
-- **主进程**（`TaskRunner`）：卡在 `rollout_loop.py:504`，`ray.get` 等 `generate_sequences` 返回，和之前推测的位置一致
-- **8 个 rollout worker**：7 个空闲，只有 rank 7（pid 20345）还在 `generate_sequences` 里
-- **nvidia-smi**：GPU 0~6 利用率 **0%**，**GPU 7 利用率 100%**，显存 73.7G，和其他卡相差不大
-- **rank 7 的调用栈**：`vllm LLM.generate → engine step → gpu_model_runner.execute_model → qwen3_5.forward → qwen3_next.forward → attention.forward → vllm_flash_attn.flash_attn_varlen_func → torch.zero_ → cudaLaunchKernel → libcuda`。线程状态 active，阻塞在 **kernel 发射**上
-- **该 worker 的 Ray stderr/stdout**：只有启动期的信息，没有任何报错或警告
-
-**解读**：
-- 主机线程卡在 `cuLaunchKernel`、GPU 却持续 100% 忙碌、3 小时没有进展，这是典型的 **GPU 上某个 kernel 永不结束**，导致 CUDA 发射队列被占满。不是 Python 层面的死循环：如果 vLLM 的引擎循环还在推进，`max_tokens=128` 早就让请求结束了
-- 也不是 NCCL 死锁：rollout 用 TP=1，每张卡独立生成，不涉及跨卡通信
-- 栈里看到的是被阻塞的那次发射，真正不结束的是它前面已经发射的某个 kernel。候选：Qwen3.5 混合注意力（`qwen3_next` 的 GatedDeltaNet，属于 fla/mamba 类内核）或 flash-attn varlen，在 **prefix caching + mamba cache `align` 模式 + chunked prefill** 组合下（vLLM 0.17 对混合模型的这条路径支持还比较新），拿到异常的元数据后死循环
-- 只有一次快照，**还不能确定是哪个 kernel**
-
-**这也解释了首轮两次卡死**：现象完全相同（只剩约 1/8 算力在跑）。`enable_prefix_caching=True` 硬编码在 `vllm_rollout_spmd.py:201`，所有任务都开着，`KEEP_AWAKE` 开没开都卡过。所以 `KEEP_AWAKE` 不是根因，但它仍然有效地去掉了每个环境步一次的全量同步。
-
-**频率**：3 次卡死分别发生在约第 10、25、27 个训练步，约每 20 步一次，每次都是 8 张卡里的某一张。
-
-**后续可选方案**：
-1. **关掉 prefix caching 做对照**：在 `engine_kwargs` 里覆盖 `enable_prefix_caching=False`，确认卡死是否消失。代价：h29 同一 rollout 内历史前缀的复用没了，rollout 会变慢。另外需要确认关掉之后，mamba cache 模式和 chunked prefill 的约束是否随之放宽
-2. **给单次 generate 加超时**：driver 端等 `generate_sequences` 改成带超时的 `ray.get`，超时直接让任务退出，交给看门狗重启。比现在先等 3 小时再处理快得多，但仍会丢掉自上次存档以来的进度
-3. **现在的看门狗能兜底**：约每 20 步卡一次，每次损失约 3~8 小时。对 100 步规模的训练可以接受，长期训练就必须根治
-
 ---
 
 ## 下一步（从"能跑"到"能用于实验"）
