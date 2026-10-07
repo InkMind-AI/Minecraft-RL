@@ -136,6 +136,10 @@ MAX_CKPT_TO_KEEP="${MAX_CKPT_TO_KEEP:-null}"
 # 炸了。我们的 rollout 是离线 LLM.generate、不存在跨进程重复上传的问题，缓存收益很小，
 # 直接设 0 关掉（每次都完整传图，彻底消除失步）。单帧模式不受影响，也一并关掉。
 MM_PROCESSOR_CACHE_GB="${MM_PROCESSOR_CACHE_GB:-0}"
+# 10-07：三次 rollout 卡死的现场都是单卡 vLLM 前向 kernel 永不结束，prefix caching（Qwen3.5
+# 混合注意力会因此进入 mamba cache 'align' 模式）是头号嫌疑。设 False 做对照。
+# 默认 True，与此前所有任务一致
+ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-True}"
 
 python rl_train/verl_jobs/prepare_minecraft_data.py --out "$DATA_DIR" \
   --train "$TRAIN_BATCH" --val "$VAL_BATCH"
@@ -178,6 +182,7 @@ python3 -m verl.trainer.main_ppo \
     +actor_rollout_ref.rollout.limit_images=$LIMIT_IMAGES \
     actor_rollout_ref.rollout.max_num_batched_tokens=$MAX_BATCHED_TOKENS \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.mm_processor_cache_gb=$MM_PROCESSOR_CACHE_GB \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.enable_prefix_caching=$ENABLE_PREFIX_CACHING \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=$LOGPROB_MICRO_BATCH \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \

@@ -53,6 +53,7 @@ case "${LAUNCH_SCRIPT}" in
     launch_qwen2vl_ns_checkpoint.sh)          SHORT_TAG="q2vlns1" ;;
     launch_qwen35_nofocal_checkpoint.sh)      SHORT_TAG="q35${VARIANT:-x}nof" ;;
     launch_qwen2vl_nofocal_checkpoint.sh)     SHORT_TAG="q2vl${VARIANT:-x}nof" ;;
+    launch_verl_grpo_checkpoint.sh)           SHORT_TAG="vg-t${TOTAL_STEP:-${STEP:-x}}" ;;
     *)
         # 未知脚本：用脚本名(去掉launch_/.sh、下划线转连字符)截断到8字符 + 4位hash保证唯一
         SHORT_TAG="${LAUNCH_SCRIPT#launch_}"
@@ -85,16 +86,22 @@ TASKLIST_EXPORT=""
 if [ -n "${TASK_DIFFICULTY_LIST:-}" ]; then
     TASKLIST_EXPORT="export TASK_DIFFICULTY_LIST=$(printf '%q' "${TASK_DIFFICULTY_LIST}"); "
 fi
+VERL_EXPORT=""
+for V in EXP STEP TOTAL_STEP; do
+    if [ -n "${!V:-}" ]; then VERL_EXPORT="${VERL_EXPORT}export ${V}=${!V}; "; fi
+done
 
 # "axiomjin-eval-"(14字符) + SHORT_TAG + CKPT_SUFFIX，务必控制在29字符以内。
 JOB_NAME="axiomjin-eval-${SHORT_TAG}${CKPT_SUFFIX}"
 JOB_NAME="${JOB_NAME:0:29}"
 
-REMOTE_CMD="set -euo pipefail; export REPO_ROOT=/data/work/run_codes/Minecraft-CoT; ${CKPT_EXPORT}${NOOP_TAG_EXPORT}${BENCH_EXPORT}${ROLLOUT_EXPORT}${TASKLIST_EXPORT}cd /data/work/run_codes/Minecraft-CoT; apt-get update -qq 2>&1 | tail -3 || true; apt-get install -y -qq xvfb 2>&1 | tail -5 || true; bash examples/eval_backbones/${LAUNCH_SCRIPT}"
+REMOTE_CMD="set -euo pipefail; export REPO_ROOT=/data/work/run_codes/Minecraft-CoT; ${CKPT_EXPORT}${NOOP_TAG_EXPORT}${BENCH_EXPORT}${ROLLOUT_EXPORT}${TASKLIST_EXPORT}${VERL_EXPORT}cd /data/work/run_codes/Minecraft-CoT; apt-get update -qq 2>&1 | tail -3 || true; apt-get install -y -qq xvfb 2>&1 | tail -5 || true; bash examples/eval_backbones/${LAUNCH_SCRIPT}"
 
 echo "[submit] job=${JOB_NAME}"
 echo "[submit] launch_script=${LAUNCH_SCRIPT} ckpt=${CKPT:-<none>} noop_tag=${NOOP_TAG:-<none>} eval_benchmark=${EVAL_BENCHMARK:-<run_backbone_eval.sh默认值>} rollouts_per_task=${ROLLOUTS_PER_TASK:-<run_backbone_eval.sh默认值>}"
-koala submit -m normal -j "${JOB_NAME}" -g 1 \
+# koala CLI ≥2.4：--s3-log 已移除（日志改用 koala logs --cluster aws --all 查看）；默认集群
+# 变成了 H20，代码、权重和镜像都在 AWS，所以必须显式 --cluster aws
+koala submit -m normal -j "${JOB_NAME}" -g 1 --cluster "${KOALA_CLUSTER:-aws}" \
     -c "${REMOTE_CMD}" \
     --code "${CODE_S3_URI}:/data/work/run_codes" \
-    --large-ssd --s3-log -y
+    --large-ssd -y

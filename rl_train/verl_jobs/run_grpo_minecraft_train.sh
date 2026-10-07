@@ -54,6 +54,13 @@ UPLOAD_INTERVAL_S="${UPLOAD_INTERVAL_S:-600}"
 STALL_TIMEOUT_S="${STALL_TIMEOUT_S:-10800}"
 MAX_STALL_RESTARTS="${MAX_STALL_RESTARTS:-3}"
 export VERL_ROLLOUT_KEEP_AWAKE="${VERL_ROLLOUT_KEEP_AWAKE:-1}"
+# 10-07：单次 generate（一个环境步）正常只要几秒到十几秒；每个训练步第一次 generate 会做
+# 全量权重同步，也只需约 1 分钟。15 分钟没返回就判定卡死（见 verl/single_controller/ray/base.py），
+# 比"3 小时无新 step"快得多。之后最多等 15 分钟，留给看门狗抓现场
+export VERL_GENERATE_TIMEOUT_S="${VERL_GENERATE_TIMEOUT_S:-900}"
+export VERL_GENERATE_TIMEOUT_GRACE_S="${VERL_GENERATE_TIMEOUT_GRACE_S:-900}"
+# 10-05 实验验证：rollout −34%、整步 −26%，生成分布不变（见 verl_debug_progress.md 方案 B）
+export VERL_ROLLOUT_SKIP_DONE="${VERL_ROLLOUT_SKIP_DONE:-1}"
 # 卡死时若 py-spy 抓不到栈，向 worker 发 SIGABRT，faulthandler 会把所有线程的
 # Python 栈打进 Ray worker 的 stderr 日志（随 ray_logs.tgz 一起上传）
 export PYTHONFAULTHANDLER=1
@@ -162,12 +169,31 @@ TAIL_PID=$!
 LAST_N=0
 LAST_PROGRESS_T=$(date +%s)
 
+count_gen_timeouts() {
+    local n
+    n="$(grep -c '\[GENERATE_TIMEOUT\]' "$LOG" 2>/dev/null)"
+    echo "${n:-0}"
+}
+LAST_GT=0
+LAST_UPLOAD_T=$(date +%s)
+POLL_S="${POLL_S:-30}"
+
 while true; do
     while kill -0 "$TRAIN_PID" 2>/dev/null; do
-        sleep "$UPLOAD_INTERVAL_S" &
+        sleep "$POLL_S" &
         wait $! 2>/dev/null
-        upload_ready_ckpts
-        N=$(count_steps); NOW=$(date +%s)
+        NOW=$(date +%s)
+        if [ $((NOW - LAST_UPLOAD_T)) -ge "$UPLOAD_INTERVAL_S" ]; then
+            upload_ready_ckpts; LAST_UPLOAD_T=$NOW
+        fi
+        N=$(count_steps); GT=$(count_gen_timeouts)
+        if [ "$GT" -gt "$LAST_GT" ]; then
+            # base.py 打出标记后会等 VERL_GENERATE_TIMEOUT_GRACE_S 再退出，趁 worker 还活着抓现场
+            LAST_GT=$GT
+            echo "[grpo-train][WATCHDOG] 检测到 [GENERATE_TIMEOUT]（单次 generate 超过 ${VERL_GENERATE_TIMEOUT_S}s），判定卡死"
+            STALLED=1
+            break
+        fi
         if [ "$N" -gt "$LAST_N" ]; then
             LAST_N=$N; LAST_PROGRESS_T=$NOW
         elif [ $((NOW - LAST_PROGRESS_T)) -ge "$STALL_TIMEOUT_S" ]; then
@@ -176,6 +202,11 @@ while true; do
             break
         fi
     done
+    if [ "$STALLED" != "1" ] && [ $(count_gen_timeouts) -gt "$LAST_GT" ]; then
+        # 训练进程在两次轮询之间就因超时退出了（没有看门狗等待期时可能发生）：同样按卡死重启
+        LAST_GT=$(count_gen_timeouts); STALLED=1
+        echo "[grpo-train][WATCHDOG] 训练进程因 [GENERATE_TIMEOUT] 退出，按卡死重启"
+    fi
     [ "$STALLED" = "1" ] || break
     dump_hang_diag $((NOW - LAST_PROGRESS_T))
     kill_training

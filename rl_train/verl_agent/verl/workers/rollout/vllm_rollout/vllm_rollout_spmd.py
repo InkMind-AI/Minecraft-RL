@@ -164,6 +164,12 @@ class vLLMRollout(BaseRollout):
         #    (which can vary across different vLLM versions);
         # - Otherwise it's the desired value we want to explicitly set.
         engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
+        # 10-07：prefix caching 改为可配置（engine_kwargs.vllm.enable_prefix_caching），默认
+        # 仍为 True。grpo_h29 三次卡死的现场显示是单卡 vLLM 前向里某个 kernel 永不结束
+        # （GPU 100%、主机线程阻塞在 cuLaunchKernel），Qwen3.5 混合注意力 + prefix caching
+        # + mamba cache 'align' 是头号嫌疑，需要能关掉做对照。下面 LLM(...) 显式传了这个
+        # 参数，所以必须从 engine_kwargs 里取出，否则会 "multiple values for keyword argument"。
+        enable_prefix_caching = engine_kwargs.pop("enable_prefix_caching", True)
         if config.get("limit_images", None):  # support for multi-image data
             engine_kwargs["limit_mm_per_prompt"] = {"image": config.get("limit_images")}
 
@@ -198,7 +204,7 @@ class vLLMRollout(BaseRollout):
             disable_log_stats=config.disable_log_stats,
             max_num_batched_tokens=max_num_batched_tokens,
             enable_chunked_prefill=config.enable_chunked_prefill,
-            enable_prefix_caching=True,
+            enable_prefix_caching=enable_prefix_caching,
             trust_remote_code=trust_remote_code,
             seed=config.get("seed", 0),
             **compilation_config,

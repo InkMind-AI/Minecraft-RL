@@ -48,7 +48,25 @@ def func_generator(self, method_name, dispatch_fn, collect_fn, execute_fn, block
             padding_count = kwargs.pop(_padding_size_key, 0)
             output = execute_fn(method_name, *args, **kwargs)
             if blocking:
-                output = ray.get(output)
+                # 10-07：rollout 的单次 generate（一个环境步）正常只要几秒到十几秒；三次卡死
+                # 都是某一张卡的 vLLM 前向 kernel 永不结束、这里的 ray.get 无限期等待。设了
+                # VERL_GENERATE_TIMEOUT_S 时给 generate_sequences 加超时：超时抛异常让训练
+                # 进程退出，由 run_grpo_minecraft_train.sh 的看门狗立刻抓现场并从最新存档
+                # 重启，不必再等 3 小时的"无新 step"判定。其他方法（update/log_prob/存档）
+                # 耗时随数据量变化大，不加超时。
+                _t = os.environ.get("VERL_GENERATE_TIMEOUT_S")
+                if _t and method_name.endswith("generate_sequences"):
+                    try:
+                        output = ray.get(output, timeout=float(_t))
+                    except ray.exceptions.GetTimeoutError:
+                        print(f"[GENERATE_TIMEOUT] {method_name} 超过 {_t}s 未返回，判定 rollout worker 卡死", flush=True)
+                        # driver 一抛异常退出，Ray 就会杀掉卡住的 worker，现场随之消失。
+                        # 先等一段时间，让外部看门狗看到上面这行标记后 py-spy 抓栈、再由它杀进程；
+                        # 没有看门狗时，等待结束后照常抛出。
+                        time.sleep(float(os.environ.get("VERL_GENERATE_TIMEOUT_GRACE_S", "0")))
+                        raise
+                else:
+                    output = ray.get(output)
             output = collect_fn(self, output)
             if padding_count > 0:
                 if isinstance(output, DataProto):
